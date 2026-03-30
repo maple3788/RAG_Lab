@@ -1,0 +1,7 @@
+numpy
+pandas
+matplotlib
+tqdm
+sentence-transformers
+faiss-cpu
+torch
