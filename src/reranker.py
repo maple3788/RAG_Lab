@@ -26,7 +26,10 @@ class Reranker:
         return reranked, scores[top]
 
 
-def load_reranker(model_name: str) -> Reranker:
-    model = CrossEncoder(model_name)
+def load_reranker(model_name: str, *, device: str | None = None) -> Reranker:
+    kwargs = {}
+    if device is not None:
+        kwargs["device"] = device
+    model = CrossEncoder(model_name, **kwargs)
     return Reranker(name=model_name, model=model)
 

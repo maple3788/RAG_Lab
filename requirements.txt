@@ -5,3 +5,4 @@ tqdm
 sentence-transformers
 faiss-cpu
 torch
+ir-measures

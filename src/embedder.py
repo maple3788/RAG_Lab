@@ -13,11 +13,17 @@ class EmbeddingModel:
     model: SentenceTransformer
     normalize: bool = True
 
-    def encode(self, texts: Sequence[str], *, batch_size: int = 64) -> np.ndarray:
+    def encode(
+        self,
+        texts: Sequence[str],
+        *,
+        batch_size: int = 64,
+        show_progress_bar: bool = False,
+    ) -> np.ndarray:
         vecs = self.model.encode(
             list(texts),
             batch_size=batch_size,
-            show_progress_bar=False,
+            show_progress_bar=show_progress_bar,
             convert_to_numpy=True,
             normalize_embeddings=self.normalize,
         )
@@ -26,8 +32,16 @@ class EmbeddingModel:
         return vecs.astype(np.float32, copy=False)
 
 
-def load_embedding_model(model_name: str, *, normalize: bool = True) -> EmbeddingModel:
-    model = SentenceTransformer(model_name)
+def load_embedding_model(
+    model_name: str,
+    *,
+    normalize: bool = True,
+    device: str | None = None,
+) -> EmbeddingModel:
+    kwargs = {}
+    if device is not None:
+        kwargs["device"] = device
+    model = SentenceTransformer(model_name, **kwargs)
     return EmbeddingModel(name=model_name, model=model, normalize=normalize)
 
 

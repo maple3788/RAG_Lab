@@ -1,0 +1,3 @@
+setting,recall@3
+no_rerank,1.0
+bge_reranker,1.0

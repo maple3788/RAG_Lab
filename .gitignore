@@ -1,0 +1,4 @@
+.venv/
+**/.rag_lab_cache/
+__pycache__/
+*.py[cod]

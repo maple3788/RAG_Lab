@@ -72,8 +72,11 @@ def evaluate_retrieval(
 
         scores.append(recall_at_k(candidate_texts, ex.answer))
 
+    # Metric name matches how many chunks we score: initial top_k from FAISS, or
+    # rerank_top_k after reranking (not the larger retrieve_k when reranking).
+    recall_k = rerank_top_k if reranker is not None else top_k
     return {
-        f"recall@{top_k}": float(mean(scores)),
+        f"recall@{recall_k}": float(mean(scores)),
         "n_questions": float(len(examples)),
         "n_chunks": float(len(corpus_chunks)),
         "index_dim": float(faiss_index.dim),
