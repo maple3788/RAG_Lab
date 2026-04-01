@@ -1,3 +1,4 @@
+.env
 .venv/
 **/.rag_lab_cache/
 __pycache__/

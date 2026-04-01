@@ -18,6 +18,11 @@ rag-lab
 │   ├── retriever.py
 │   ├── reranker.py
 │   ├── metrics.py
+│   ├── answer_metrics.py      # EM / F1 / gold hit (generation)
+│   ├── context_truncation.py
+│   ├── prompts.py
+│   ├── generator.py           # Gemini + mock
+│   ├── rag_generation.py      # retrieve → generate → score
 │   ├── rag_pipeline.py
 │   ├── beir_io.py
 │   └── faiss_cache.py
@@ -27,7 +32,8 @@ rag-lab
 │   ├── exp_embedding.py
 │   ├── exp_chunk_size.py
 │   ├── exp_rerank.py
-│   └── exp_trec_covid.py
+│   ├── exp_trec_covid.py
+│   └── exp_rag_generation.py  # end-to-end RAG answer quality
 └── results
     ├── embedding_results.csv
     └── *.png
@@ -39,6 +45,7 @@ rag-lab
 2. **Chunk size analysis** (`experiments/exp_chunk_size.py`)
 3. **Reranking evaluation** (`experiments/exp_rerank.py`)
 4. **TREC-COVID (BEIR format)** (`experiments/exp_trec_covid.py`) — standard IR metrics on an official benchmark
+5. **RAG answer quality** (`experiments/exp_rag_generation.py`) — **query → retrieve → (optional rerank) → generate → evaluate** on the custom QA JSONL with **exact match**, **token F1**, and **gold answer hit** (substring). Ablations: rerank vs no rerank, `final_k`, prompt templates, context truncation (`head` / `tail` / `middle`). Uses **Google Gemini** (`GEMINI_API_KEY`); **`--mock-generation`** runs without an API (for wiring tests only).
 
 The first three experiments use **recall@k** on the small custom QA JSONL. The TREC-COVID experiment uses **graded qrels** and reports **nDCG@10, P@10, MAP, R@100** (via `ir-measures`), which matches how many retrieval papers report BEIR / TREC-style results.
 
@@ -59,6 +66,17 @@ python experiments/exp_embedding.py
 python experiments/exp_chunk_size.py
 python experiments/exp_rerank.py
 ```
+
+**End-to-end RAG evaluation** (requires `GEMINI_API_KEY` unless you pass `--mock-generation`):
+
+```bash
+cp .env.example .env   # then set GEMINI_API_KEY (from Google AI Studio)
+python experiments/exp_rag_generation.py --mode all
+```
+
+The loader reads **`.env` at the project root** via `python-dotenv`; you can still `export GEMINI_API_KEY` if you prefer. Do not commit `.env`.
+
+Modes: `compare-rerank`, `compare-topk`, `compare-prompts`, `compare-truncation`, or `all`. Outputs `results/rag_generation_results.csv`. **LLM-as-a-judge** can be added later on top of the same `generator` / metric hooks.
 
 Results will be saved to `results/` as CSV + plots.
 
@@ -150,6 +168,8 @@ Raw CSVs: `results/trec_covid_compare_embeddings.csv`, `trec_covid_compare_chunk
 **Custom QA experiments:** **recall@k** — for each question, if at least one of the top-k retrieved chunks contains the ground-truth answer string, it counts as 1; otherwise 0. The final score is the mean over all questions.
 
 **TREC-COVID:** standard IR metrics from judged qrels (see experiment script), not substring overlap.
+
+**RAG generation (`exp_rag_generation.py`):** **exact match** and **token F1** use a light normalization (lowercase, hyphen→space, strip punctuation, whitespace). **gold_hit** is 1 if the reference answer string appears in the model output (case-insensitive). These are inexpensive baselines; pair with an LLM judge when you need semantic scoring.
 
 ## Notes
 

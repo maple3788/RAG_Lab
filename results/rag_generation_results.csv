@@ -1,0 +1,4 @@
+experiment,setting,exact_match,token_f1,gold_hit,n_questions
+topk,final_k=1,0.0,0.07358457344432098,0.8,5.0
+topk,final_k=3,0.0,0.07358457344432098,0.8,5.0
+topk,final_k=5,0.0,0.07358457344432098,0.8,5.0
