@@ -2,3 +2,8 @@
 **/.rag_lab_cache/
 __pycache__/
 *.py[cod]
+
+# Local benchmark data / logs / copied server artifacts (keep README tables as source of truth)
+data/
+*.log
+RAG_Lab_results_from_server/

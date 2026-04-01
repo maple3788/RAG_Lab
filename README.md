@@ -106,6 +106,45 @@ Outputs: `results/trec_covid_beir_results.csv` for `--mode single`; comparison C
 
 Background: [NIST TREC-COVID overview](https://ir.nist.gov/covidSubmit/index.html).
 
+## Results (TREC-COVID, BEIR)
+
+Full BEIR **trec-covid** corpus and official **qrels**; dense retrieval with FAISS (`IndexFlatIP`, normalized embeddings); **`retrieve_k` = 100** so **R@100** is reported. Chunk experiments use **chunk index → max-pool to document ids** (doc-level qrels). Rerank experiment: bi-encoder retrieves **top 100** docs, **BGE-reranker-base** reranks; **R@100** is unchanged when reranking only **reorders** candidates inside that pool.
+
+### Embedding models (`compare-embeddings`)
+
+| Model | P@10 | nDCG@10 | R@100 | AP (MAP) |
+|-------|------|---------|-------|----------|
+| intfloat/e5-small-v2 | **0.784** | **0.744** | **0.136** | **0.105** |
+| BAAI/bge-base-en-v1.5 | 0.730 | 0.672 | 0.133 | 0.096 |
+| BAAI/bge-small-en-v1.5 | 0.708 | 0.666 | 0.123 | 0.087 |
+
+**E5-small-v2** scored best on all four metrics. **BGE-base** beat **BGE-small**; ranking still depends on model family and training, not only parameter count.
+
+### Chunk sizes (`compare-chunks`, bi-encoder BGE-base)
+
+| chunk_size | P@10 | nDCG@10 | R@100 | AP |
+|------------|------|---------|-------|-----|
+| 256 | **0.738** | **0.682** | **0.133** | **0.097** |
+| 512 | 0.730 | 0.672 | 0.133 | 0.096 |
+| 1024 | 0.730 | 0.672 | 0.133 | 0.096 |
+
+**256** (word-token–style chunks) slightly improved **P@10** and **nDCG@10** vs **512 / 1024**; the latter two were nearly identical. Effect size is modest.
+
+### Reranking (`compare-rerank`, bi-encoder BGE-base)
+
+| Setting | P@10 | nDCG@10 | R@100 | AP |
+|---------|------|---------|-------|-----|
+| Bi-encoder only | 0.730 | 0.672 | 0.133 | 0.096 |
+| + BGE-reranker-base | **0.818** | **0.762** | 0.133 | **0.102** |
+
+**Cross-encoder reranking** improved **P@10** and **nDCG@10** strongly. **R@100** did not change, which is expected when **R@100** is evaluated on the **same first-stage top-100** candidate set. **AP** increased slightly.
+
+### One-line summary
+
+On BEIR TREC-COVID, **E5-small** achieved the best dense retrieval scores among the three bi-encoders; **chunk size 256** slightly improved **BGE-base** over 512/1024; **BGE-reranker** improved **P@10** and **nDCG@10** with **no R@100 gain** under a fixed top-100 pool.
+
+Raw CSVs: `results/trec_covid_compare_embeddings.csv`, `trec_covid_compare_chunks.csv`, `trec_covid_compare_rerank.csv` (paths may differ if copied elsewhere).
+
 ## Metric
 
 **Custom QA experiments:** **recall@k** — for each question, if at least one of the top-k retrieved chunks contains the ground-truth answer string, it counts as 1; otherwise 0. The final score is the mean over all questions.
