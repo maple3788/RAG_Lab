@@ -1,0 +1,9 @@
+# Quieter dev: Streamlit's file watcher introspects all imported packages (e.g. Hugging Face
+# `transformers`), which triggers thousands of lazy-`__path__` warnings. Disabling the watcher
+# stops that walk. Reload the app in the browser after you edit Python files (or rerun
+# the `streamlit run` command).
+[server]
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false
