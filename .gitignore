@@ -8,3 +8,4 @@ __pycache__/
 data/
 *.log
 RAG_Lab_results_from_server/
+analysis/*.jsonl

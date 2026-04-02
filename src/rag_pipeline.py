@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from src.chunker import chunk_documents, chunks_to_texts
 from src.embedder import (
@@ -43,6 +43,19 @@ def build_retrieval_corpus(
     return chunks_to_texts(chunks)
 
 
+def build_corpus_chunks_from_documents(
+    documents: Sequence[str],
+    *,
+    chunk_size: int,
+    chunk_overlap: int,
+) -> List[str]:
+    """Chunk arbitrary document strings (e.g. full BEIR corpus bodies) into passage strings."""
+    chunks = chunk_documents(
+        list(documents), chunk_size=chunk_size, chunk_overlap=chunk_overlap
+    )
+    return chunks_to_texts(chunks)
+
+
 def build_retrieval_index(
     embedder: EmbeddingModel,
     corpus_chunks: Sequence[str],
@@ -50,6 +63,37 @@ def build_retrieval_index(
     passages = prepare_passages(embedder.name, corpus_chunks)
     corpus_emb = embedder.encode(passages)
     return build_faiss_index(corpus_emb)
+
+
+def retrieve_passages_pool_and_final(
+    question: str,
+    embedder: EmbeddingModel,
+    corpus_chunks: Sequence[str],
+    faiss_index: FaissIndex,
+    *,
+    retrieve_k: int,
+    reranker: Optional[Reranker] = None,
+    final_k: int = 3,
+) -> Tuple[List[str], List[str]]:
+    """
+    ``pool``: FAISS top-``retrieve_k`` passages (before rerank).
+    ``final``: passages passed to the LLM (after rerank or slice to ``final_k``).
+    """
+    k = min(retrieve_k, len(corpus_chunks))
+    if k <= 0:
+        return [], []
+    q = prepare_query(embedder.name, question)
+    q_emb = embedder.encode([q])
+    _, idx = search(faiss_index, q_emb, top_k=k)
+    pool = gather_texts_by_indices(corpus_chunks, idx[0].tolist())
+
+    if reranker is not None:
+        final_texts, _ = reranker.rerank(
+            question, pool, top_k=min(final_k, len(pool))
+        )
+    else:
+        final_texts = pool[: min(final_k, len(pool))]
+    return pool, final_texts
 
 
 def retrieve_passages_for_query(
@@ -63,21 +107,16 @@ def retrieve_passages_for_query(
     final_k: int = 3,
 ) -> List[str]:
     """Retrieve up to `retrieve_k` from FAISS; optionally rerank down to `final_k` passages."""
-    k = min(retrieve_k, len(corpus_chunks))
-    if k <= 0:
-        return []
-    q = prepare_query(embedder.name, question)
-    q_emb = embedder.encode([q])
-    _, idx = search(faiss_index, q_emb, top_k=k)
-    candidate_texts = gather_texts_by_indices(corpus_chunks, idx[0].tolist())
-
-    if reranker is not None:
-        candidate_texts, _ = reranker.rerank(
-            question, candidate_texts, top_k=min(final_k, len(candidate_texts))
-        )
-    else:
-        candidate_texts = candidate_texts[: min(final_k, len(candidate_texts))]
-    return candidate_texts
+    _, final_texts = retrieve_passages_pool_and_final(
+        question,
+        embedder,
+        corpus_chunks,
+        faiss_index,
+        retrieve_k=retrieve_k,
+        reranker=reranker,
+        final_k=final_k,
+    )
+    return final_texts
 
 
 def evaluate_retrieval(

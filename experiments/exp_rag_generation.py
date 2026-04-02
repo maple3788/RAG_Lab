@@ -12,21 +12,30 @@ sys.path.insert(0, str(ROOT))
 
 from src.context_truncation import TruncationStrategy
 from src.embedder import load_embedding_model
-from src.generator import GeminiGenerator, MockGenerator
+from src.generator import (
+    GeminiGenerator,
+    MockGenerator,
+    OllamaGenerator,
+    OpenAICompatibleGenerator,
+)
 from src.loader import load_qa_jsonl
 from src.prompts import PROMPT_TEMPLATES
 from src.rag_generation import RAGGenerationConfig, evaluate_rag_answer_quality
-from src.rag_pipeline import build_retrieval_corpus
+from src.rag_pipeline import build_retrieval_corpus, build_retrieval_index
 from src.reranker import load_reranker
 
 
 def _make_generator(args: argparse.Namespace):
     if args.mock_generation:
         return MockGenerator()
+    if args.llm_backend == "openai":
+        return OpenAICompatibleGenerator(model=args.llm_model)
+    if args.llm_backend == "ollama":
+        return OllamaGenerator(model=args.llm_model)
     return GeminiGenerator(model=args.llm_model)
 
 
-def run_compare_rerank(embedder, corpus_chunks, examples, generator, base: RAGGenerationConfig, reranker):
+def run_compare_rerank(embedder, corpus_chunks, examples, generator, base: RAGGenerationConfig, reranker, faiss_index):
     rows = []
     for use_rerank, label in [(False, "no_rerank"), (True, "with_rerank")]:
         cfg = RAGGenerationConfig(
@@ -36,6 +45,9 @@ def run_compare_rerank(embedder, corpus_chunks, examples, generator, base: RAGGe
             prompt_template=base.prompt_template,
             max_context_chars=base.max_context_chars,
             truncation=base.truncation,
+            per_example_retrieval=base.per_example_retrieval,
+            chunk_size=base.chunk_size,
+            chunk_overlap=base.chunk_overlap,
         )
         m = evaluate_rag_answer_quality(
             examples,
@@ -44,13 +56,14 @@ def run_compare_rerank(embedder, corpus_chunks, examples, generator, base: RAGGe
             generator=generator,
             config=cfg,
             reranker=reranker if use_rerank else None,
+            faiss_index=faiss_index,
         )
         rows.append({"experiment": "rerank", "setting": label, **m})
         print(label, m)
     return rows
 
 
-def run_compare_topk(embedder, corpus_chunks, examples, generator, base: RAGGenerationConfig):
+def run_compare_topk(embedder, corpus_chunks, examples, generator, base: RAGGenerationConfig, faiss_index):
     rows = []
     for fk in [1, 3, 5]:
         cfg = RAGGenerationConfig(
@@ -60,6 +73,9 @@ def run_compare_topk(embedder, corpus_chunks, examples, generator, base: RAGGene
             prompt_template=base.prompt_template,
             max_context_chars=base.max_context_chars,
             truncation=base.truncation,
+            per_example_retrieval=base.per_example_retrieval,
+            chunk_size=base.chunk_size,
+            chunk_overlap=base.chunk_overlap,
         )
         m = evaluate_rag_answer_quality(
             examples,
@@ -68,13 +84,14 @@ def run_compare_topk(embedder, corpus_chunks, examples, generator, base: RAGGene
             generator=generator,
             config=cfg,
             reranker=None,
+            faiss_index=faiss_index,
         )
         rows.append({"experiment": "topk", "setting": f"final_k={fk}", **m})
         print(f"final_k={fk}", m)
     return rows
 
 
-def run_compare_prompts(embedder, corpus_chunks, examples, generator, base: RAGGenerationConfig):
+def run_compare_prompts(embedder, corpus_chunks, examples, generator, base: RAGGenerationConfig, faiss_index):
     rows = []
     for name, tmpl in PROMPT_TEMPLATES.items():
         cfg = RAGGenerationConfig(
@@ -84,6 +101,9 @@ def run_compare_prompts(embedder, corpus_chunks, examples, generator, base: RAGG
             prompt_template=tmpl,
             max_context_chars=base.max_context_chars,
             truncation=base.truncation,
+            per_example_retrieval=base.per_example_retrieval,
+            chunk_size=base.chunk_size,
+            chunk_overlap=base.chunk_overlap,
         )
         m = evaluate_rag_answer_quality(
             examples,
@@ -92,6 +112,7 @@ def run_compare_prompts(embedder, corpus_chunks, examples, generator, base: RAGG
             generator=generator,
             config=cfg,
             reranker=None,
+            faiss_index=faiss_index,
         )
         rows.append({"experiment": "prompt", "setting": name, **m})
         print(name, m)
@@ -106,6 +127,7 @@ def run_compare_truncation(
     base: RAGGenerationConfig,
     *,
     max_context_chars: int,
+    faiss_index,
 ):
     rows = []
     for strat in ("head", "tail", "middle"):
@@ -116,6 +138,9 @@ def run_compare_truncation(
             prompt_template=base.prompt_template,
             max_context_chars=max_context_chars,
             truncation=cast(TruncationStrategy, strat),
+            per_example_retrieval=base.per_example_retrieval,
+            chunk_size=base.chunk_size,
+            chunk_overlap=base.chunk_overlap,
         )
         m = evaluate_rag_answer_quality(
             examples,
@@ -124,6 +149,7 @@ def run_compare_truncation(
             generator=generator,
             config=cfg,
             reranker=None,
+            faiss_index=faiss_index,
         )
         rows.append({"experiment": "truncation", "setting": strat, **m})
         print(strat, m)
@@ -151,13 +177,30 @@ def main() -> None:
         help="For compare-truncation: tight char budget so head/tail/middle differ",
     )
     parser.add_argument("--truncation", default="head", choices=("head", "tail", "middle"))
-    parser.add_argument("--llm-model", default="gemini-2.0-flash", help="Gemini model id")
+    parser.add_argument(
+        "--llm-backend",
+        choices=("gemini", "openai", "ollama"),
+        default="gemini",
+        help="gemini=Google AI; openai=OpenAI-compatible; ollama=local Ollama (no cloud LLM key)",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default=None,
+        help="Model id (defaults: gemini-2.5-flash / gpt-4o-mini / llama3.2)",
+    )
     parser.add_argument(
         "--mock-generation",
         action="store_true",
         help="Use MockGenerator (no API; for pipeline smoke tests only)",
     )
     args = parser.parse_args()
+    if args.llm_model is None:
+        if args.llm_backend == "openai":
+            args.llm_model = "gpt-4o-mini"
+        elif args.llm_backend == "ollama":
+            args.llm_model = "llama3.2"
+        else:
+            args.llm_model = "gemini-2.5-flash"
 
     examples = load_qa_jsonl(args.data_path)
     out_dir = args.out_dir
@@ -181,19 +224,30 @@ def main() -> None:
         prompt_template=base_tmpl,
         max_context_chars=args.max_context_chars,
         truncation=trunc,
+        per_example_retrieval=False,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
     )
 
     reranker = None
     if args.mode in ("compare-rerank", "all"):
         reranker = load_reranker(args.rerank_model)
 
+    if base.per_example_retrieval:
+        faiss_index = None
+    else:
+        print("Building FAISS index (reused across all runs in this process)…")
+        faiss_index = build_retrieval_index(embedder, corpus_chunks)
+
     all_rows = []
     if args.mode in ("compare-rerank", "all"):
-        all_rows.extend(run_compare_rerank(embedder, corpus_chunks, examples, generator, base, reranker))
+        all_rows.extend(
+            run_compare_rerank(embedder, corpus_chunks, examples, generator, base, reranker, faiss_index)
+        )
     if args.mode in ("compare-topk", "all"):
-        all_rows.extend(run_compare_topk(embedder, corpus_chunks, examples, generator, base))
+        all_rows.extend(run_compare_topk(embedder, corpus_chunks, examples, generator, base, faiss_index))
     if args.mode in ("compare-prompts", "all"):
-        all_rows.extend(run_compare_prompts(embedder, corpus_chunks, examples, generator, base))
+        all_rows.extend(run_compare_prompts(embedder, corpus_chunks, examples, generator, base, faiss_index))
     if args.mode in ("compare-truncation", "all"):
         all_rows.extend(
             run_compare_truncation(
@@ -203,6 +257,7 @@ def main() -> None:
                 generator,
                 base,
                 max_context_chars=args.truncation_chars,
+                faiss_index=faiss_index,
             )
         )
 

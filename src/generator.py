@@ -26,7 +26,7 @@ class GeminiGenerator:
     Set GEMINI_API_KEY in the environment or in a `.env` file at the project root.
     """
 
-    model: str = "gemini-2.0-flash"
+    model: str = "gemini-2.5-flash"
     temperature: float = 0.0
     max_output_tokens: int = 256
 
@@ -37,23 +37,108 @@ class GeminiGenerator:
         api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key:
             raise ValueError(
-                "GEMINI_API_KEY is not set. Export it or use MockGenerator for dry runs."
+                "GEMINI_API_KEY is not set. Use --llm-backend ollama for local models, "
+                "or MockGenerator for dry runs."
             )
         self._client = genai.Client(api_key=api_key)
 
     def generate(self, prompt: str) -> str:
         from google.genai import types
 
-        resp = self._client.models.generate_content(
-            model=self.model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=self.temperature,
-                max_output_tokens=self.max_output_tokens,
-            ),
-        )
+        try:
+            resp = self._client.models.generate_content(
+                model=self.model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=self.temperature,
+                    max_output_tokens=self.max_output_tokens,
+                ),
+            )
+        except Exception as e:
+            msg = str(e).lower()
+            if "location" in msg or "not supported for the api" in msg:
+                raise RuntimeError(
+                    "Gemini (Google AI Studio) rejected this request due to region / IP policy. "
+                    "See docs/gemini-region-restriction.md. "
+                    "Workaround without cloud LLM keys: `--llm-backend ollama` (local model). "
+                    "Or use `--llm-backend openai` with OPENAI_API_KEY / OpenRouter."
+                ) from e
+            raise
         text = getattr(resp, "text", None) or ""
         return text.strip()
+
+
+@dataclass
+class OpenAICompatibleGenerator:
+    """
+    OpenAI Chat Completions API or any compatible server (OpenRouter, Azure, etc.).
+    Set OPENAI_API_KEY; optional OPENAI_BASE_URL.
+    """
+
+    model: str = "gpt-4o-mini"
+    temperature: float = 0.0
+    max_tokens: int = 256
+
+    def __post_init__(self) -> None:
+        from openai import OpenAI
+
+        _load_project_dotenv()
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "OPENAI_API_KEY is not set (required for --llm-backend openai). "
+                "Or use --llm-backend ollama (local) or Gemini with GEMINI_API_KEY."
+            )
+        base_url = os.environ.get("OPENAI_BASE_URL")
+        self._client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
+
+    def generate(self, prompt: str) -> str:
+        resp = self._client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+        )
+        choice = resp.choices[0]
+        content = choice.message.content
+        return (content or "").strip()
+
+
+@dataclass
+class OllamaGenerator:
+    """
+    Local open-weight models via Ollama (OpenAI-compatible API). See https://ollama.com
+    No Gemini/OpenAI cloud key required. Install Ollama, then e.g. ollama pull llama3.2
+    Default API: http://127.0.0.1:11434/v1 — set OLLAMA_BASE_URL to override.
+    """
+
+    model: str = "llama3.2"
+    temperature: float = 0.0
+    max_tokens: int = 256
+
+    def __post_init__(self) -> None:
+        from openai import OpenAI
+
+        _load_project_dotenv()
+        base = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1").strip().rstrip("/")
+        if not base.endswith("/v1"):
+            base = f"{base}/v1"
+        self._client = OpenAI(
+            base_url=base,
+            api_key="ollama",
+            timeout=120.0,
+        )
+
+    def generate(self, prompt: str) -> str:
+        resp = self._client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+        )
+        choice = resp.choices[0]
+        content = choice.message.content
+        return (content or "").strip()
 
 
 @dataclass

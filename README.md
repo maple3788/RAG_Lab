@@ -1,65 +1,52 @@
 # RAG-Lab
 
-## Overview
-
-This repository is an experiment framework for studying how retrieval components affect RAG performance.
-It is structured like a small research project: modular pipeline code, reproducible experiments, and saved results.
+Experiment framework for how retrieval affects RAG: modular pipeline, reproducible runs, saved CSVs/plots.
 
 ## Project structure
 
 ```text
 rag-lab
-├── datasets
-│   └── qa_dataset.jsonl
-├── src
-│   ├── loader.py
-│   ├── chunker.py
-│   ├── embedder.py
-│   ├── retriever.py
-│   ├── reranker.py
-│   ├── metrics.py
-│   ├── answer_metrics.py      # EM / F1 / gold hit (generation)
-│   ├── context_truncation.py
-│   ├── prompts.py
-│   ├── generator.py           # Gemini + mock
-│   ├── rag_generation.py      # retrieve → generate → score
-│   ├── rag_pipeline.py
-│   ├── beir_io.py
-│   └── faiss_cache.py
-├── data
-│   └── trec-covid/          # optional: BEIR TREC-COVID (download, see below)
-├── experiments
-│   ├── exp_embedding.py
-│   ├── exp_chunk_size.py
-│   ├── exp_rerank.py
+├── datasets/qa_dataset.jsonl
+├── src/
+│   ├── loader.py, chunker.py, embedder.py, retriever.py, reranker.py, metrics.py
+│   ├── answer_metrics.py, context_truncation.py, prompts.py
+│   ├── generator.py              # Gemini, OpenAI-compatible, Ollama, mock
+│   ├── rag_generation.py, rag_pipeline.py, beir_io.py, faiss_cache.py
+│   ├── error_analysis.py         # failure buckets (trace export)
+│   └── triviaqa_hf.py
+├── data/trec-covid/              # optional BEIR download (see below)
+├── experiments/
+│   ├── exp_embedding.py, exp_chunk_size.py, exp_rerank.py
 │   ├── exp_trec_covid.py
-│   └── exp_rag_generation.py  # end-to-end RAG answer quality
-└── results
-    ├── embedding_results.csv
-    └── *.png
+│   ├── exp_rag_generation.py           # custom QA JSONL
+│   ├── exp_rag_generation_trec.py      # BEIR TREC-COVID corpus
+│   └── exp_rag_generation_triviaqa.py  # HuggingFace TriviaQA RC
+├── analysis/                     # ERROR_ANALYSIS.md, TRACES_JSONL_FIELDS.md; optional JSONL via tools/
+├── tools/export_triviaqa_traces.py
+└── results/                      # CSVs + *.png
 ```
 
 ## Experiments
 
-1. **Embedding model comparison** (`experiments/exp_embedding.py`)
-2. **Chunk size analysis** (`experiments/exp_chunk_size.py`)
-3. **Reranking evaluation** (`experiments/exp_rerank.py`)
-4. **TREC-COVID (BEIR format)** (`experiments/exp_trec_covid.py`) — standard IR metrics on an official benchmark
-5. **RAG answer quality** (`experiments/exp_rag_generation.py`) — **query → retrieve → (optional rerank) → generate → evaluate** on the custom QA JSONL with **exact match**, **token F1**, and **gold answer hit** (substring). Ablations: rerank vs no rerank, `final_k`, prompt templates, context truncation (`head` / `tail` / `middle`). Uses **Google Gemini** (`GEMINI_API_KEY`); **`--mock-generation`** runs without an API (for wiring tests only).
+| # | Script | What it measures |
+|---|--------|------------------|
+| 1 | `exp_embedding.py` | recall@k (custom QA JSONL) |
+| 2 | `exp_chunk_size.py` | recall@k |
+| 3 | `exp_rerank.py` | recall@k |
+| 4 | `exp_trec_covid.py` | nDCG@10, P@10, MAP, R@100 (BEIR qrels) |
+| 5 | `exp_rag_generation.py` | EM, token F1, gold_hit on custom QA; ablations: rerank, `final_k`, prompts, truncation (`head`/`tail`/`middle`). Default LLM **Gemini** (`GEMINI_API_KEY`). **Region blocked?** `--llm-backend ollama` ([Ollama](https://ollama.com), e.g. `ollama pull llama3.2`). Also `--llm-backend openai`, `docs/gemini-region-restriction.md`. **`--mock-generation`**: no API (wiring only). |
+| 6 | `exp_rag_generation_trec.py` | Same ablations as (5) on FAISS over BEIR corpus; gold = `metadata.query` (keyword proxy). `--max-docs` / `--max-queries` for smoke tests. → `results/trec_rag_generation_results.csv` |
+| 7 | `exp_rag_generation_triviaqa.py` | `mandarjoshi/trivia_qa` / `rc` (`datasets`); per-question retrieval over passages; EM/F1 vs aliases. → `results/triviaqa_rag_generation_results.csv` |
 
-The first three experiments use **recall@k** on the small custom QA JSONL. The TREC-COVID experiment uses **graded qrels** and reports **nDCG@10, P@10, MAP, R@100** (via `ir-measures`), which matches how many retrieval papers report BEIR / TREC-style results.
+First three: **recall@k**. TREC-COVID: **graded qrels** (`ir-measures`), BEIR-style reporting.
 
 ## Quickstart
 
-Create env and install dependencies:
-
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+cp .env.example .env   # GEMINI_API_KEY, OPENAI_*, OLLAMA_BASE_URL — optional
 ```
-
-Run experiments:
 
 ```bash
 python experiments/exp_embedding.py
@@ -67,66 +54,47 @@ python experiments/exp_chunk_size.py
 python experiments/exp_rerank.py
 ```
 
-**End-to-end RAG evaluation** (requires `GEMINI_API_KEY` unless you pass `--mock-generation`):
+**RAG (needs LLM or Ollama or `--mock-generation`):**
 
 ```bash
-cp .env.example .env   # then set GEMINI_API_KEY (from Google AI Studio)
 python experiments/exp_rag_generation.py --mode all
+# ollama pull llama3.2 && python experiments/exp_rag_generation.py --mode all --llm-backend ollama
 ```
 
-The loader reads **`.env` at the project root** via `python-dotenv`; you can still `export GEMINI_API_KEY` if you prefer. Do not commit `.env`.
+Modes: `compare-rerank`, `compare-topk`, `compare-prompts`, `compare-truncation`, `all` → `results/rag_generation_results.csv`.
 
-Modes: `compare-rerank`, `compare-topk`, `compare-prompts`, `compare-truncation`, or `all`. Outputs `results/rag_generation_results.csv`. **LLM-as-a-judge** can be added later on top of the same `generator` / metric hooks.
+```bash
+python experiments/exp_rag_generation_trec.py --data-dir data/trec-covid --mode all --llm-backend ollama
+python experiments/exp_rag_generation_triviaqa.py --split validation --max-examples 200 --mode all --llm-backend ollama
+```
 
-Results will be saved to `results/` as CSV + plots.
+`.env` is loaded from project root (`python-dotenv`). Do not commit `.env`.
 
-## TREC-COVID (formal benchmark, BEIR packaging)
+## TREC-COVID (BEIR)
 
-Many papers evaluate on **TREC-COVID** using the **BEIR** release: fixed corpus, topics, and qrels so numbers are comparable across systems.
-
-1. Download and unzip (large, ~hundreds of MB):
-
-   - [BEIR `trec-covid.zip`](https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/trec-covid.zip)
-
-2. You should get a folder containing at least:
-
-   - `corpus.jsonl`
-   - `queries.jsonl`
-   - `qrels/test.tsv`
-
-3. Point the experiment at that folder. **Single run** (one bi-encoder):
+1. Download [trec-covid.zip](https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/trec-covid.zip) (large).
+2. Folder needs `corpus.jsonl`, `queries.jsonl`, `qrels/test.tsv`.
+3. Run:
 
 ```bash
 python experiments/exp_trec_covid.py --data-dir data/trec-covid --device mps
-```
-
-**Ablations** (same spirit as `exp_embedding.py` / `exp_chunk_size.py` / `exp_rerank.py`):
-
-```bash
-# Several embedding models → results/trec_covid_compare_embeddings.csv
 python experiments/exp_trec_covid.py --data-dir data/trec-covid --mode compare-embeddings
-
-# Chunk sizes (chunk index → max-pool to doc ids, matches doc-level qrels) → trec_covid_compare_chunks.csv
 python experiments/exp_trec_covid.py --data-dir data/trec-covid --mode compare-chunks --embedding-model BAAI/bge-base-en-v1.5
-
-# Bi-encoder only vs bi-encoder + cross-encoder rerank → trec_covid_compare_rerank.csv
 python experiments/exp_trec_covid.py --data-dir data/trec-covid --mode compare-rerank --first-stage-k 100
-
-# Run all three comparisons in one go (long)
-python experiments/exp_trec_covid.py --data-dir data/trec-covid --mode compare-all
+python experiments/exp_trec_covid.py --data-dir data/trec-covid --mode compare-all   # long
 ```
 
-Optional flags: `--embedding-model`, `--embedding-models`, `--chunk-sizes`, `--chunk-search-k`, `--rerank-model`, `--retrieve-k` (use **≥ 100** for **R@100**), `--max-queries` / `--max-docs` for debugging only.
+Flags: `--embedding-model(s)`, `--chunk-sizes`, `--chunk-search-k`, `--rerank-model`, `--retrieve-k` (≥100 for R@100), `--max-queries` / `--max-docs` (debug only).
 
-**Index cache:** FAISS indices and id lists are stored under `<data-dir>/.rag_lab_cache/` (override with `--cache-dir`) so reruns with the **same** corpus fingerprint, embedding model, and (for chunk mode) chunk settings **reuse** the index instead of re-encoding. Use `--no-cache` to force a full rebuild.
+**Cache:** `<data-dir>/.rag_lab_cache/` (override `--cache-dir`); same corpus + embedding + chunk settings reuse FAISS. `--no-cache` rebuilds.
 
-Outputs: `results/trec_covid_beir_results.csv` for `--mode single`; comparison CSVs as above. Column **`AP`** is **MAP** (mean average precision).
+Outputs: `results/trec_covid_beir_results.csv` (`--mode single`); comparison CSVs as above. Column **AP** = MAP.
 
-Background: [NIST TREC-COVID overview](https://ir.nist.gov/covidSubmit/index.html).
+Background: [NIST TREC-COVID](https://ir.nist.gov/covidSubmit/index.html).
 
 ## Results (TREC-COVID, BEIR)
 
-Full BEIR **trec-covid** corpus and official **qrels**; dense retrieval with FAISS (`IndexFlatIP`, normalized embeddings); **`retrieve_k` = 100** so **R@100** is reported. Chunk experiments use **chunk index → max-pool to document ids** (doc-level qrels). Rerank experiment: bi-encoder retrieves **top 100** docs, **BGE-reranker-base** reranks; **R@100** is unchanged when reranking only **reorders** candidates inside that pool.
+Setup: full BEIR corpus + qrels; FAISS `IndexFlatIP`, normalized embeddings; **`retrieve_k` = 100**. Chunks: index → max-pool to doc ids. Rerank: bi-encoder top-100 → **BGE-reranker-base**; R@100 unchanged if only reordering inside pool.
 
 ### Embedding models (`compare-embeddings`)
 
@@ -136,9 +104,7 @@ Full BEIR **trec-covid** corpus and official **qrels**; dense retrieval with FAI
 | BAAI/bge-base-en-v1.5 | 0.730 | 0.672 | 0.133 | 0.096 |
 | BAAI/bge-small-en-v1.5 | 0.708 | 0.666 | 0.123 | 0.087 |
 
-**E5-small-v2** scored best on all four metrics. **BGE-base** beat **BGE-small**; ranking still depends on model family and training, not only parameter count.
-
-### Chunk sizes (`compare-chunks`, bi-encoder BGE-base)
+### Chunk sizes (`compare-chunks`, BGE-base)
 
 | chunk_size | P@10 | nDCG@10 | R@100 | AP |
 |------------|------|---------|-------|-----|
@@ -146,34 +112,79 @@ Full BEIR **trec-covid** corpus and official **qrels**; dense retrieval with FAI
 | 512 | 0.730 | 0.672 | 0.133 | 0.096 |
 | 1024 | 0.730 | 0.672 | 0.133 | 0.096 |
 
-**256** (word-token–style chunks) slightly improved **P@10** and **nDCG@10** vs **512 / 1024**; the latter two were nearly identical. Effect size is modest.
-
-### Reranking (`compare-rerank`, bi-encoder BGE-base)
+### Reranking (`compare-rerank`, BGE-base)
 
 | Setting | P@10 | nDCG@10 | R@100 | AP |
 |---------|------|---------|-------|-----|
 | Bi-encoder only | 0.730 | 0.672 | 0.133 | 0.096 |
 | + BGE-reranker-base | **0.818** | **0.762** | 0.133 | **0.102** |
 
-**Cross-encoder reranking** improved **P@10** and **nDCG@10** strongly. **R@100** did not change, which is expected when **R@100** is evaluated on the **same first-stage top-100** candidate set. **AP** increased slightly.
+**Summary:** E5-small best among three bi-encoders; chunk **256** slightly edges 512/1024 for BGE-base; rerank lifts P@10/nDCG@10, not R@100 in a fixed top-100 pool.
 
-### One-line summary
+Raw CSVs: `results/trec_covid_compare_embeddings.csv`, `trec_covid_compare_chunks.csv`, `trec_covid_compare_rerank.csv`.
 
-On BEIR TREC-COVID, **E5-small** achieved the best dense retrieval scores among the three bi-encoders; **chunk size 256** slightly improved **BGE-base** over 512/1024; **BGE-reranker** improved **P@10** and **nDCG@10** with **no R@100 gain** under a fixed top-100 pool.
+## Results (TriviaQA RC, RAG generation)
 
-Raw CSVs: `results/trec_covid_compare_embeddings.csv`, `trec_covid_compare_chunks.csv`, `trec_covid_compare_rerank.csv` (paths may differ if copied elsewhere).
+**Run:** GPU server, Ollama `llama3.2`, `BAAI/bge-base-en-v1.5`, `BAAI/bge-reranker-base`, `validation`, `--max-examples 200`, `--mode all`. **Metrics:** EM, token F1 (best alias), gold_hit. Server copy: `RAG_Lab_results_from_server/triviaqa_rag_generation_results.csv`.
 
-## Metric
+### Reranking
 
-**Custom QA experiments:** **recall@k** — for each question, if at least one of the top-k retrieved chunks contains the ground-truth answer string, it counts as 1; otherwise 0. The final score is the mean over all questions.
+| Setting | EM | Token F1 | Gold hit |
+|---------|-----|----------|----------|
+| No rerank | 0.455 | 0.592 | 0.715 |
+| + BGE reranker | **0.475** | **0.613** | **0.730** |
 
-**TREC-COVID:** standard IR metrics from judged qrels (see experiment script), not substring overlap.
+### Top-k
 
-**RAG generation (`exp_rag_generation.py`):** **exact match** and **token F1** use a light normalization (lowercase, hyphen→space, strip punctuation, whitespace). **gold_hit** is 1 if the reference answer string appears in the model output (case-insensitive). These are inexpensive baselines; pair with an LLM judge when you need semantic scoring.
+| final_k | EM | Token F1 | Gold hit |
+|---------|-----|----------|----------|
+| 1 | 0.430 | 0.587 | 0.705 |
+| 3 | 0.455 | 0.592 | 0.715 |
+| 5 | 0.455 | 0.592 | 0.715 |
+
+### Prompts
+
+| Template | EM | Token F1 | Gold hit |
+|----------|-----|----------|----------|
+| default | 0.455 | 0.592 | 0.715 |
+| bullets | **0.520** | **0.632** | 0.695 |
+| strict_cite | 0.430 | 0.538 | 0.660 |
+
+### Truncation (`--truncation-chars` 1200)
+
+| Strategy | EM | Token F1 | Gold hit |
+|----------|-----|----------|----------|
+| head | **0.420** | **0.545** | **0.635** |
+| tail | 0.310 | 0.406 | 0.470 |
+| middle | 0.295 | 0.396 | 0.475 |
+
+**Summary (n=200):** Rerank + **bullets** help; **strict_cite** and **tail/middle** truncation hurt under tight budget; **final_k ≥ 3** plateaus vs 5.
+
+### Failure analysis & traces
+
+Stratify: **retrieval** (no gold in top-`retrieve_k` pool), **ranking** (gold in pool, not in top-`final_k`), **generation** (gold in LLM context, answer still wrong). Details: `analysis/ERROR_ANALYSIS.md`.
+
+**Export:** `python tools/export_triviaqa_traces.py --out analysis/triviaqa_traces.jsonl --max-examples 100 --skip-generation` (no LLM) or drop `--skip-generation` for predictions + `failure_bucket`. Field reference: `analysis/TRACES_JSONL_FIELDS.md`.
+
+**Trace stats (optional JSONL from export; large files are gitignored — generate locally):** On a sample of **100** rows (skip-generation) vs **50** with LLM (subset of the same IDs), `retrieval_stage` counts align on the overlap. Example counts: 100-row: `gold_in_final` 94, `ranking` 6; 50-row: `gold_in_final` 45, `ranking` 5. With LLM (n=50): `failure_bucket` — none 33, ranking 5, generation 12; `gold_lost_to_truncation` 3 in the 100-row export (0 in the 50-row slice). Means n=50: EM **0.66**, token F1 **~0.76**, gold_hit **0.86**.
+
+| Kind | `question_id` | Question (short) | Model output (short) | `failure_bucket` / `retrieval_stage` |
+|------|----------------|------------------|----------------------|--------------------------------------|
+| Success | `tc_33` | Lloyd Webber musical, US premiere 10 Dec 1993 | `Sunset Boulevard.` | `none` / `gold_in_final` |
+| Success | `tc_49` | 70s No 1 *Kiss You All Over* | `Exile.` | `none` / `gold_in_final` |
+| Ranking | `tc_40` | Next PM after Arthur Balfour | `David Lloyd George.` (gold: *Campbell-Bannerman*) | `ranking` / `ranking` |
+| Generation | `tc_455` | Pfeiffer film + Coolio *Gangsta’s Paradise* | `Bad Teacher.` (gold: *Dangerous Minds*) | `generation` / `gold_in_final` |
+| Generation | `tc_241` | African country whose capital is Niamey | `Niamey is the capital of Niger.` | `generation` / `gold_in_final` |
+
+## Metrics
+
+- **Custom QA retrieval:** recall@k — mean over questions with gold substring in any top-k chunk.
+- **TREC-COVID:** IR metrics from qrels (see script).
+- **RAG generation:** EM / token F1 after light normalization; **gold_hit** = reference substring in output (case-insensitive). Add an LLM judge for semantic scoring if needed.
 
 ## Notes
 
-- Models are loaded via `sentence-transformers` so you can swap in BGE / E5 / rerankers easily.
-- Dataset is JSONL for easy extension.
-- For leaderboard-comparable TREC-COVID runs, use the full corpus and official qrels; avoid `--max-docs` except for smoke tests.
-
+- Optional **LLM-as-a-judge** can plug into the same `generator` / metric hooks later.
+- Models via `sentence-transformers` (swap BGE / E5 / rerankers).
+- Datasets are JSONL for easy extension.
+- TREC leaderboard-style runs: full corpus + official qrels; avoid `--max-docs` except smoke tests.
