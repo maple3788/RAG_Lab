@@ -9,9 +9,11 @@ How **retrieval** choices affect **RAG**: one modular pipeline, benchmarks, CSVs
 ```text
 rag-lab
 ├── datasets/qa_dataset.jsonl
-├── demo/app.py                 # Streamlit: upload → FAISS + rerank → LLM (see below)
+├── demo/app.py                 # Streamlit: session RAG, MinIO ingest, query saved jobs
+├── docker-compose.yml          # AiStor image (quay.io/…/aistor) + Redis — `docker compose up -d`
 ├── src/                        # loader, chunker, embedder, retriever, hybrid_retrieval (BM25+RRF),
-│                               # reranker, metrics, generator, rag_pipeline, rag_generation, …
+│                               # reranker, metrics, generator, rag_pipeline, rag_generation,
+│                               # document_ingest_pipeline, storage/ (MinIO, Redis), …
 ├── data/trec-covid/            # optional BEIR
 ├── experiments/                # exp_embedding, exp_chunk_size, exp_rerank, exp_trec_covid,
 │                               # exp_rag_generation*.py, exp_qasper_hybrid_compare.py
@@ -50,16 +52,51 @@ For long documents, **dense-only** FAISS search can miss chunks that match lexic
 ```bash
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env    # optional: GEMINI_API_KEY, OPENAI_*, OLLAMA_BASE_URL
+cp .env.example .env    # optional: GEMINI_API_KEY, OPENAI_*, OLLAMA_BASE_URL, MINIO_*, REDIS_URL
 ```
 
-**Streamlit demo** (upload PDF/text, ask questions, tabs: FAISS chunks → cross-encoder rerank → prompt + answer):
+### Streamlit demo (`demo/app.py`)
+
+Three sidebar views: **Ingest** (run pipeline → MinIO + Redis), **Query** (RAG over a loaded corpus), **Library** (list jobs from MinIO metadata).
 
 ```bash
 .venv/bin/streamlit run demo/app.py
 ```
 
-Use the **project venv** so `sentence_transformers` / `torch` match. Index is **in-memory only**: each new `streamlit run` or server restart needs **upload + “Build index”** again. Removing the file in the widget does **not** clear the index until you rebuild or reload the session. Persistence: not implemented (would need disk cache or a vector DB). `.streamlit/config.toml` turns off file-watching to avoid Hugging Face `transformers` log spam; refresh the browser after code edits.
+Use the **project venv** so `sentence_transformers` / `torch` match. `.streamlit/config.toml` disables file-watching to reduce Hugging Face `transformers` log noise; refresh the browser after code edits.
+
+**Session vs persisted index:** RAG state (FAISS + chunks) lives **in process memory** while Streamlit runs. To reuse a corpus across restarts, run **Ingest** once, then in **Query** attach a **`job_id`** and **Load** so chunks and `faiss.index` are pulled from MinIO again.
+
+### Document ingest (MinIO + Redis)
+
+Stack (optional, for **Ingest** / **Library** / loading jobs in **Query**):
+
+```bash
+docker compose up -d    # object store API :9000, console :9001, Redis :6379
+```
+
+Copy `.env.example` → `.env` and set **`MINIO_*`** (endpoint is `host:port` only) and **`REDIS_URL`** if not using defaults. The Compose file uses the **AiStor**-published MinIO image (`quay.io/minio/aistor/minio:latest`) plus **Redis 7**; see comments in `docker-compose.yml` for TLS and port conflicts.
+
+**Pipeline (implementation: `src/document_ingest_pipeline.py`):**
+
+1. **Extract** — PDF via pypdf (optional page filter `1,3,5-7`); text/Markdown as UTF-8.
+2. **Chunk** — whitespace token windows (`chunk_size` / `chunk_overlap` in `src/chunker.py`).
+3. **Summarize (optional)** — strategies `single` | `hierarchical` | `iterative`; LLM or stub.
+4. **Embed + FAISS** — SentenceTransformers → `IndexFlatIP` (normalized vectors), serialized with `src/retriever.py`.
+5. **Store** — objects under `{job_id}/` in the bucket; **Redis** key `ingest:job:{id}` tracks stage (`queued` … `completed` / `failed`).
+
+**Artifacts in MinIO (prefix `{job_id}/`):**
+
+| Object | Role |
+|--------|------|
+| `source.bin` | Original upload |
+| `extracted_text.json` | Filename, size, short preview |
+| `chunks.json` | Chunk texts (+ optional per-chunk summaries) |
+| `faiss.index` | Serialized FAISS index bytes |
+| `metadata.json` | Job metadata (model, chunk params, `n_chunks`, `index_dim`, …) |
+| `summary.json` | Present for iterative global summary only |
+
+**Query-time load:** `load_ingest_from_minio` downloads `chunks.json` + `faiss.index` and deserializes FAISS **in RAM**. MinIO is **object storage**, not a queryable vector database.
 
 **Batch experiments:**
 
@@ -170,7 +207,7 @@ Long document QA evaluation. Metrics focus on Token F1 and Gold Hit (whether the
 
 **Limitations**
 - **Exact Match (EM) is Harsh:** EM scores are very low (3-5%) because QASPER answers are often long aliases or phrases, and LLMs rarely generate the *exact* string without surrounding conversational text. Token F1 and Gold Hit are better signals here.
-- **In-Memory Indexing:** The current Streamlit demo uses an in-memory FAISS index, meaning the index resets on server restarts. A production version would require a persistent Vector DB (e.g., Milvus, Pinecone).
+- **Indexing model:** The demo still **searches in memory** after loading; MinIO persists **artifacts**, not live ANN serving. For managed low-latency vector search at scale, you would add a vector database or hosted retrieval service—MinIO here is durable blob storage for ingest outputs.
 
 Long papers (10k–30k+ chars); defaults e.g. `--chunk-size 384`, `--max-context-chars 8000`. **Rerank** helps; **k=5 > k=3 > k=1** on F1/gold hit; **bullets** best EM; **strict_cite** lowers gold hit; **head > tail > middle** under truncation. Figures: `python scripts/generate_charts.py` → `assets/qasper_*.png`. CSV: `results/qasper_rag_generation_results.csv`.
 

@@ -1,16 +1,9 @@
 """
-Lightweight Streamlit demo for the RAG pipeline: upload a document, ask questions,
-and inspect retrieval, reranking, and the final LLM prompt.
+Streamlit: sidebar nav (**Ingest** | **Query** | **Library**), MinIO-backed ingest, job browser.
 
-Run from repo root with the same environment as ``pip install -r requirements.txt``::
+Run::
 
-    .venv/bin/streamlit run demo/app.py
-
-Using a different ``streamlit`` on ``PATH`` (e.g. conda base) may miss ``sentence_transformers``.
-
-Project ``.streamlit/config.toml`` disables the file watcher so the terminal is not flooded by
-Hugging Face ``transformers`` lazy-import messages; after code edits, refresh the app or restart
-``streamlit run``.
+    streamlit run demo/app.py
 """
 
 from __future__ import annotations
@@ -18,14 +11,12 @@ from __future__ import annotations
 import logging
 import warnings
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
-# Before importing sentence_transformers / transformers (via src.embedder).
 warnings.filterwarnings("ignore", message=r"Accessing `__path__`")
 logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("transformers.models").setLevel(logging.ERROR)
 
-import io
 import sys
 
 import numpy as np
@@ -35,7 +26,16 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from dotenv import load_dotenv
+
+load_dotenv(ROOT / ".env")
+
 from src.context_truncation import TruncationStrategy, truncate_context
+from src.document_ingest_pipeline import (
+    IngestPipelineConfig,
+    load_ingest_from_minio,
+    run_document_ingest,
+)
 from src.embedder import EmbeddingModel, load_embedding_model, prepare_query
 from src.generator import (
     GeminiGenerator,
@@ -46,9 +46,10 @@ from src.generator import (
 )
 from src.prompts import PROMPT_TEMPLATES, format_rag_prompt
 from src.rag_generation import passages_to_context
-from src.rag_pipeline import build_corpus_chunks_from_documents, build_retrieval_index
 from src.reranker import Reranker, load_reranker
 from src.retriever import FaissIndex, gather_texts_by_indices, search
+from src.storage.minio_artifacts import MinioArtifactStore, load_minio_settings
+from src.storage.redis_jobs import RedisJobStore
 
 
 DEFAULT_EMBED = "BAAI/bge-base-en-v1.5"
@@ -65,17 +66,8 @@ def cached_reranker(model_name: str) -> Reranker:
     return load_reranker(model_name)
 
 
-def extract_text_from_upload(name: str, data: bytes) -> str:
-    lower = name.lower()
-    if lower.endswith(".pdf"):
-        from pypdf import PdfReader
-
-        reader = PdfReader(io.BytesIO(data))
-        parts: List[str] = []
-        for page in reader.pages:
-            parts.append(page.extract_text() or "")
-        return "\n\n".join(parts)
-    return data.decode("utf-8", errors="replace")
+def _minio_store() -> MinioArtifactStore:
+    return MinioArtifactStore(load_minio_settings())
 
 
 def make_generator(backend: str) -> TextGenerator:
@@ -86,6 +78,21 @@ def make_generator(backend: str) -> TextGenerator:
     if backend == "ollama":
         return OllamaGenerator()
     return MockGenerator()
+
+
+def ingest_summarizer(backend: str):
+    if backend == "mock":
+
+        def _fn(text: str) -> str:
+            return (text[:300] + "…") if len(text) > 300 else text
+
+        return _fn
+    gen = make_generator(backend)
+
+    def _fn(text: str) -> str:
+        return gen.generate(text)
+
+    return _fn
 
 
 def cross_encoder_rerank_trace(
@@ -128,7 +135,7 @@ def run_pipeline(
     k = min(retrieve_k, len(corpus_chunks))
     if k <= 0:
         return {
-            "error": "No chunks in index. Upload a non-empty document.",
+            "error": "No index loaded.",
             "retrieved": [],
             "rerank_rows": [],
             "final_passages": [],
@@ -188,100 +195,354 @@ def run_pipeline(
     }
 
 
-def main() -> None:
-    st.set_page_config(page_title="RAG Lab Demo", layout="wide")
-    st.title("RAG pipeline demo")
-    st.caption("Upload a PDF or text file, then ask questions. Expand sections below the answer to inspect retrieval and prompts.")
+def render_rag_trace(result: dict, *, ui_id: int, final_k: int) -> None:
+    fk = int(final_k)
+    tab_chunks, tab_rerank, tab_prompt = st.tabs(
+        ["Retrieved chunks (FAISS)", "Reranking (cross-encoder)", "Final prompt & answer"]
+    )
 
+    with tab_chunks:
+        st.markdown(
+            "Top-K from bi-encoder + FAISS (inner product on normalized vectors ≈ cosine similarity)."
+        )
+        for row in result["retrieved"]:
+            with st.expander(
+                f"Rank {row['faiss_rank']} · chunk #{row['chunk_index']} · {row['faiss_score']:.4f}"
+            ):
+                st.text_area(
+                    "Chunk",
+                    row["text"],
+                    height=min(240, 24 + 12 * row["text"].count("\n")),
+                    key=f"{ui_id}_c_{row['faiss_rank']}_{row['chunk_index']}",
+                    label_visibility="collapsed",
+                )
+
+    with tab_rerank:
+        if not result["use_rerank"]:
+            st.info("Reranking off — using FAISS order for final passages.")
+        elif not result["rerank_rows"]:
+            st.warning("Empty pool.")
+        else:
+            for row in result["rerank_rows"]:
+                with st.expander(f"CE rank {row['new_rank']} (was FAISS #{row['faiss_rank']}) · {row['cross_encoder_score']:.4f}"):
+                    st.text_area(
+                        "Passage",
+                        row["text"],
+                        height=min(240, 24 + 12 * row["text"].count("\n")),
+                        key=f"{ui_id}_r_{row['new_rank']}",
+                        label_visibility="collapsed",
+                    )
+            st.caption(f"Passages 1–{min(fk, len(result['rerank_rows']))} → LLM context.")
+
+    with tab_prompt:
+        st.caption(
+            f"Context ~{len(result.get('raw_context', ''))} chars · "
+            f"truncation **{result['truncation']}** → **{result['max_context_chars']}**"
+        )
+        st.text_area("Prompt", result["prompt"], height=360, key=f"{ui_id}_p")
+        st.write("**Answer (repeat)**")
+        st.write(result["answer"])
+
+
+def unload_index() -> None:
+    st.session_state.corpus_chunks = []
+    st.session_state.faiss_index = None
+    st.session_state.source_label = None
+    st.session_state.ingest_meta = {}
+    st.session_state.loaded_job_id = None
+    st.session_state.pop("last_rag", None)
+    st.session_state.pop("last_question", None)
+
+
+def load_job(job_id: str) -> None:
+    chunks, faiss_index, meta = load_ingest_from_minio(job_id.strip())
+    st.session_state.corpus_chunks = chunks
+    st.session_state.faiss_index = faiss_index
+    st.session_state.ingest_meta = meta
+    fn = meta.get("filename") or "document"
+    st.session_state.source_label = f"{job_id.strip()} · {fn}"
+    st.session_state.loaded_job_id = job_id.strip()
+    st.session_state.last_job_id = job_id.strip()
+    st.session_state.pop("last_rag", None)
+    st.session_state.pop("last_question", None)
+
+
+def _init_session() -> None:
     if "corpus_chunks" not in st.session_state:
         st.session_state.corpus_chunks = []
     if "faiss_index" not in st.session_state:
         st.session_state.faiss_index = None
     if "source_label" not in st.session_state:
         st.session_state.source_label = None
+    if "ingest_meta" not in st.session_state:
+        st.session_state.ingest_meta = {}
+    if "last_job_id" not in st.session_state:
+        st.session_state.last_job_id = ""
+    if "loaded_job_id" not in st.session_state:
+        st.session_state.loaded_job_id = None
+    if "nav" not in st.session_state:
+        st.session_state.nav = "ingest"
 
+
+def _sidebar_nav() -> str:
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"] { min-width: 14rem; }
+        section[data-testid="stSidebar"] > div { padding-top: 1rem; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     with st.sidebar:
-        st.header("Document")
-        uploaded = st.file_uploader(
-            "PDF or text file",
-            type=["pdf", "txt", "md"],
-            help="PDFs are read with pypdf (text extraction). .txt/.md are UTF-8.",
+        st.markdown("### RAG Lab")
+        nav = st.session_state.nav
+        b1 = st.button(
+            "Ingest",
+            key="nav_ingest",
+            use_container_width=True,
+            type="primary" if nav == "ingest" else "secondary",
         )
-        if uploaded is not None:
-            data = uploaded.getvalue()
-            text = extract_text_from_upload(uploaded.name, data)
-            if not text.strip():
-                st.warning("No text extracted. Try another file or a .txt copy of the paper.")
+        b2 = st.button(
+            "Query",
+            key="nav_query",
+            use_container_width=True,
+            type="primary" if nav == "query" else "secondary",
+        )
+        b3 = st.button(
+            "Library",
+            key="nav_library",
+            use_container_width=True,
+            type="primary" if nav == "library" else "secondary",
+        )
+        if b1:
+            st.session_state.nav = "ingest"
+        if b2:
+            st.session_state.nav = "query"
+        if b3:
+            st.session_state.nav = "library"
+        st.divider()
+        st.caption("MinIO + Redis")
+    return st.session_state.nav
+
+
+def main() -> None:
+    st.set_page_config(page_title="RAG Lab", layout="wide", initial_sidebar_state="expanded")
+    _init_session()
+    _sidebar_nav()
+
+    st.title("Document pipeline")
+    nav = st.session_state.nav
+    if nav == "ingest":
+        _ui_ingest_pipeline()
+    elif nav == "query":
+        _ui_query()
+    else:
+        _ui_library()
+
+
+def _ui_ingest_pipeline() -> None:
+    st.caption("Upload → filter → extract → chunk & summarize → embed → **MinIO** + **Redis**")
+
+    st.subheader("1 — Upload & page filter")
+    up_col, filt_col = st.columns(2)
+    with up_col:
+        uploaded = st.file_uploader("Document", type=["pdf", "txt", "md"], key="ing_upl")
+    with filt_col:
+        page_spec = st.text_input(
+            "Page filter (PDF)",
+            "",
+            placeholder="1,3,5-8 — empty = all",
+        )
+
+    st.subheader("2 — Extraction")
+    extraction = st.radio("Depth", ("shallow", "full"), horizontal=True)
+
+    st.subheader("3 — Chunking & summarization")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        chunk_size = st.number_input("Chunk size", 128, 2048, 512, 64)
+        chunk_overlap = st.number_input("Chunk overlap", 0, 512, 64, 32)
+    with c2:
+        strat = st.selectbox(
+            "Summarization strategy",
+            ("single", "hierarchical", "iterative"),
+        )
+    with c3:
+        summ_backend = st.selectbox(
+            "Summarizer LLM (if not single)",
+            ["mock", "gemini", "openai", "ollama"],
+        )
+
+    st.subheader("4 — Run → MinIO + Redis")
+    if st.button("Run full pipeline", type="primary"):
+        if uploaded is None:
+            st.error("Upload a document first.")
+        else:
+            try:
+                cfg = IngestPipelineConfig(
+                    chunk_size=int(chunk_size),
+                    chunk_overlap=int(chunk_overlap),
+                    extraction=extraction,  # type: ignore[arg-type]
+                    summarization=strat,  # type: ignore[arg-type]
+                )
+                summ = ingest_summarizer(summ_backend) if strat != "single" else None
+                with st.spinner("Running pipeline…"):
+                    meta = run_document_ingest(
+                        filename=uploaded.name,
+                        raw_bytes=uploaded.getvalue(),
+                        page_filter_spec=page_spec,
+                        config=cfg,
+                        summarizer=summ,
+                    )
+                st.success(f"**job_id:** `{meta['job_id']}`")
+                st.json(meta)
+                st.session_state["last_job_id"] = meta["job_id"]
+            except Exception as e:
+                st.exception(e)
+
+    st.divider()
+    st.subheader("Redis job status")
+    jid = st.text_input("Job ID", value=st.session_state.get("last_job_id", ""))
+    if jid and st.button("Refresh Redis status"):
+        try:
+            st.write(RedisJobStore().get_status(jid.strip()))
+        except Exception as e:
+            st.warning(str(e))
+
+
+def _ui_library() -> None:
+    st.caption("Jobs stored in MinIO (prefix = **job_id**).")
+    if st.button("Refresh list"):
+        st.session_state.library_refresh = st.session_state.get("library_refresh", 0) + 1
+
+    try:
+        rows = _minio_store().list_ingest_jobs_table()
+    except Exception as e:
+        st.error(f"MinIO: {e}")
+        return
+
+    if not rows:
+        st.info("No jobs yet. Run an **Ingest** first.")
+        return
+
+    st.dataframe(
+        rows,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "job_id": st.column_config.TextColumn("job_id", width="large"),
+            "filename": st.column_config.TextColumn("filename"),
+            "n_chunks": st.column_config.NumberColumn("chunks"),
+            "embedding_model": st.column_config.TextColumn("embedding"),
+            "summarization": st.column_config.TextColumn("summary strat"),
+            "extraction": st.column_config.TextColumn("extraction"),
+        },
+    )
+    st.caption(f"**{len(rows)}** job(s) in bucket `{load_minio_settings().bucket}`.")
+
+
+def _job_label_for_select(row: dict[str, Any]) -> str:
+    jid = row["job_id"]
+    fn = row.get("filename", "?")
+    nc = row.get("n_chunks", "?")
+    short = f"{jid[:8]}…" if len(jid) > 12 else jid
+    return f"{short} · {fn} · {nc} chunks"
+
+
+def _ui_query() -> None:
+    st.caption("Attach an index from MinIO, then ask questions. **Attach** checked + **Load** = fetch index; **Attach** unchecked + **Load** = unload.")
+
+    try:
+        jobs = _minio_store().list_ingest_jobs_table()
+    except Exception as e:
+        st.error(f"MinIO: {e}")
+        return
+
+    st.subheader("Index in memory")
+    if st.session_state.loaded_job_id and st.session_state.faiss_index is not None:
+        st.success(
+            f"Loaded **{st.session_state.loaded_job_id}** — "
+            f"{len(st.session_state.corpus_chunks)} chunks · {st.session_state.source_label}"
+        )
+    else:
+        st.warning("No index loaded.")
+
+    st.subheader("Attach & load")
+    attach = st.checkbox(
+        "Attach index for querying",
+        value=True,
+        help="Checked: **Load** downloads the selected job into memory. Unchecked: **Load** clears the index (unload).",
+    )
+
+    options: List[str] = [r["job_id"] for r in jobs]
+    label_by_id = {r["job_id"]: _job_label_for_select(r) for r in jobs}
+
+    if not options:
+        st.info("No jobs in MinIO yet — use **Ingest** first.")
+        selected = None
+    else:
+        default_ix = 0
+        lid = st.session_state.get("loaded_job_id")
+        if lid and lid in options:
+            default_ix = options.index(lid)
+        selected = st.selectbox(
+            "Job",
+            options=options,
+            index=default_ix,
+            format_func=lambda jid: label_by_id.get(jid, jid),
+        )
+
+    if st.button("Load", type="primary"):
+        if attach:
+            if not selected:
+                st.error("No job to load.")
             else:
-                chunk_size = st.number_input("Chunk size", min_value=128, max_value=2048, value=512, step=64)
-                chunk_overlap = st.number_input("Chunk overlap", min_value=0, max_value=512, value=64, step=32)
-                if st.button("Build index from upload", type="primary"):
-                    with st.spinner("Chunking and embedding…"):
-                        chunks = build_corpus_chunks_from_documents(
-                            [text],
-                            chunk_size=int(chunk_size),
-                            chunk_overlap=int(chunk_overlap),
-                        )
-                        emb = cached_embedder(DEFAULT_EMBED)
-                        st.session_state.corpus_chunks = chunks
-                        st.session_state.faiss_index = build_retrieval_index(emb, chunks)
-                        st.session_state.source_label = uploaded.name
-                        st.session_state.pop("last_rag", None)
-                        st.session_state.pop("last_question", None)
-                    st.success(f"Indexed {len(chunks)} chunks from {uploaded.name}.")
-
-        st.divider()
-        st.header("Retrieval")
-        retrieve_k = st.slider("FAISS top-K (pool)", min_value=3, max_value=30, value=10)
-        final_k = st.slider("Final passages to LLM", min_value=1, max_value=10, value=3)
-        use_rerank = st.checkbox("Use cross-encoder reranker", value=True)
-        if use_rerank:
-            st.caption(f"Model: `{DEFAULT_RERANK}` (cached after first load).")
-
-        st.divider()
-        st.header("Prompt & context")
-        template_key = st.selectbox(
-            "Prompt template",
-            options=list(PROMPT_TEMPLATES.keys()),
-            format_func=lambda k: f"{k}",
-        )
-        prompt_template = PROMPT_TEMPLATES[template_key]
-        max_context_chars = st.number_input(
-            "Max context chars (truncation)", min_value=500, max_value=32000, value=6000, step=500
-        )
-        truncation = st.selectbox(
-            "Truncation strategy",
-            options=["head", "tail", "middle"],
-            format_func=lambda x: x,
-        )
-
-        st.divider()
-        st.header("LLM")
-        backend = st.selectbox(
-            "Backend",
-            options=["mock", "gemini", "openai", "ollama"],
-            help="mock: no API. gemini / openai / ollama use .env keys like the experiments.",
-        )
-
-    col_q, col_go = st.columns([4, 1])
-    with col_q:
-        question = st.text_input(
-            "Question",
-            placeholder="Ask something answerable from your document…",
-            label_visibility="collapsed",
-        )
-    with col_go:
-        ask = st.button("Ask", type="primary", use_container_width=True)
+                try:
+                    load_job(selected)
+                    st.success(f"Loaded `{selected}`")
+                    st.rerun()
+                except Exception as e:
+                    st.exception(e)
+        else:
+            unload_index()
+            st.success("Index unloaded from memory.")
+            st.rerun()
 
     ready = (
         st.session_state.faiss_index is not None
         and len(st.session_state.corpus_chunks) > 0
     )
+
+    with st.expander("Retrieval & generation settings", expanded=ready):
+        retrieve_k = st.slider("FAISS top-K", 3, 30, 10, disabled=not ready)
+        final_k = st.slider("Final passages to LLM", 1, 10, 3, disabled=not ready)
+        use_rerank = st.checkbox("Cross-encoder rerank", value=True, disabled=not ready)
+        template_key = st.selectbox(
+            "Prompt template",
+            list(PROMPT_TEMPLATES.keys()),
+            disabled=not ready,
+        )
+        max_context_chars = st.number_input(
+            "Max context chars", 500, 32000, 6000, step=500, disabled=not ready
+        )
+        truncation = st.selectbox("Truncation", ["head", "tail", "middle"], disabled=not ready)
+        backend = st.selectbox(
+            "LLM",
+            ["mock", "gemini", "openai", "ollama"],
+            disabled=not ready,
+        )
+
     if not ready:
-        st.info("Upload a file and click **Build index from upload** in the sidebar to begin.")
+        st.info("Attach a job and click **Load** to enable questions.")
         return
 
-    st.caption(f"Indexed document: **{st.session_state.source_label}** — {len(st.session_state.corpus_chunks)} chunks.")
+    st.divider()
+    col_q, col_a = st.columns([4, 1])
+    with col_q:
+        question = st.text_input("Question", placeholder="Ask about the document…")
+    with col_a:
+        ask = st.button("Ask", type="primary", use_container_width=True)
 
     if ask and question.strip():
         embedder = cached_embedder(DEFAULT_EMBED)
@@ -289,10 +550,9 @@ def main() -> None:
         try:
             gen = make_generator(backend)
         except Exception as e:
-            st.error(f"Could not initialize generator ({backend}): {e}")
+            st.error(f"Generator: {e}")
             return
-
-        with st.spinner("Retrieving and generating…"):
+        with st.spinner("Retrieving & generating…"):
             result = run_pipeline(
                 question.strip(),
                 embedder=embedder,
@@ -302,16 +562,14 @@ def main() -> None:
                 final_k=final_k,
                 use_rerank=use_rerank,
                 reranker=reranker,
-                prompt_template=prompt_template,
+                prompt_template=PROMPT_TEMPLATES[template_key],
                 max_context_chars=int(max_context_chars),
                 truncation=truncation,  # type: ignore[arg-type]
                 generator=gen,
             )
-
         if result.get("error"):
             st.error(result["error"])
             return
-
         st.session_state["last_rag"] = result
         st.session_state["last_question"] = question.strip()
         st.session_state["last_rag_ui"] = st.session_state.get("last_rag_ui", 0) + 1
@@ -319,76 +577,15 @@ def main() -> None:
 
     result = st.session_state.get("last_rag")
     if not result:
-        st.info("Type a question and click **Ask** to see retrieval traces and the generated answer.")
+        st.info("Ask a question above.")
         return
 
-    ui_id = st.session_state.get("last_rag_ui", 0)
-    last_q = st.session_state.get("last_question", "")
-    fk = int(st.session_state.get("last_final_k", final_k))
-
     st.subheader("Answer")
-    if last_q:
-        st.caption(f"Question: {last_q}")
+    st.caption(f"Q: {st.session_state.get('last_question', '')}")
     st.write(result["answer"])
-
-    tab_chunks, tab_rerank, tab_prompt = st.tabs(
-        ["Retrieved chunks (FAISS)", "Reranking (cross-encoder)", "Final prompt & answer"]
-    )
-
-    with tab_chunks:
-        st.markdown(
-            "Top-K passages from the bi-encoder + FAISS index (inner product on normalized embeddings ≈ cosine similarity)."
-        )
-        for row in result["retrieved"]:
-            with st.expander(
-                f"Rank {row['faiss_rank']} · chunk #{row['chunk_index']} · score {row['faiss_score']:.4f}"
-            ):
-                st.text_area(
-                    "Chunk text",
-                    row["text"],
-                    height=min(240, 24 + 12 * row["text"].count("\n")),
-                    key=f"{ui_id}_chunk_{row['faiss_rank']}_{row['chunk_index']}",
-                    label_visibility="collapsed",
-                )
-
-    with tab_rerank:
-        if not result["use_rerank"]:
-            st.info("Cross-encoder reranking is **off**. Final passages are the first **Final passages to LLM** rows from the FAISS list (in FAISS order).")
-        elif not result["rerank_rows"]:
-            st.warning("No rerank rows (empty pool).")
-        else:
-            st.markdown(
-                "**New rank** is after sorting by cross-encoder score. **FAISS rank** is the original bi-encoder order within the retrieved pool."
-            )
-            for row in result["rerank_rows"]:
-                with st.expander(
-                    f"New rank {row['new_rank']} (was FAISS #{row['faiss_rank']}) · CE score {row['cross_encoder_score']:.4f}"
-                ):
-                    st.text_area(
-                        "Passage",
-                        row["text"],
-                        height=min(240, 24 + 12 * row["text"].count("\n")),
-                        key=f"{ui_id}_rr_{row['new_rank']}",
-                        label_visibility="collapsed",
-                    )
-            st.caption(
-                f"Passages **{1}–{min(fk, len(result['rerank_rows']))}** above are merged into the context for the LLM (see next tab)."
-            )
-
-    with tab_prompt:
-        raw_len = len(result.get("raw_context", ""))
-        st.caption(
-            f"Context length after merging passages: {raw_len} chars. "
-            f"Truncation: **{result['truncation']}** to **{result['max_context_chars']}** chars before formatting the prompt."
-        )
-        st.text_area(
-            "Prompt sent to the LLM",
-            result["prompt"],
-            height=360,
-            key=f"{ui_id}_prompt_full",
-        )
-        st.subheader("Model reply (duplicate)")
-        st.write(result["answer"])
+    ui_id = st.session_state.get("last_rag_ui", 0)
+    fk = int(st.session_state.get("last_final_k", 3))
+    render_rag_trace(result, ui_id=ui_id, final_k=fk)
 
 
 if __name__ == "__main__":

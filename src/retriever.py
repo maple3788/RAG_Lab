@@ -55,3 +55,22 @@ def gather_texts_by_indices(texts: Sequence[str], indices: Sequence[int]) -> Lis
         out.append(texts[int(i)])
     return out
 
+
+def serialize_faiss_index(faiss_index: FaissIndex) -> bytes:
+    """Persist FAISS index to bytes (e.g. upload to MinIO)."""
+    raw = faiss.serialize_index(faiss_index.index)
+    if isinstance(raw, np.ndarray):
+        return raw.tobytes()
+    return bytes(raw)
+
+
+def deserialize_faiss_index(data: bytes | np.ndarray) -> FaissIndex:
+    """Restore ``FaissIndex`` from bytes produced by :func:`serialize_faiss_index`."""
+    if isinstance(data, bytes):
+        data = np.frombuffer(data, dtype=np.uint8)
+    elif not isinstance(data, np.ndarray):
+        data = np.asarray(data, dtype=np.uint8)
+    idx = faiss.deserialize_index(data)
+    dim = int(idx.d)
+    return FaissIndex(index=idx, dim=dim)
+
