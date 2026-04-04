@@ -4,6 +4,7 @@ matplotlib
 tqdm
 sentence-transformers
 faiss-cpu
+rank-bm25
 torch
 torchvision
 ir-measures

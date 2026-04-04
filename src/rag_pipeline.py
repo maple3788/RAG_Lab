@@ -11,6 +11,7 @@ from src.embedder import (
 )
 from src.loader import QAExample
 from src.metrics import mean, recall_at_k
+from src.hybrid_retrieval import BM25Resources, retrieve_hybrid_pool
 from src.retriever import FaissIndex, build_faiss_index, gather_texts_by_indices, search
 from src.reranker import Reranker
 
@@ -74,18 +75,33 @@ def retrieve_passages_pool_and_final(
     retrieve_k: int,
     reranker: Optional[Reranker] = None,
     final_k: int = 3,
+    bm25_resources: Optional[BM25Resources] = None,
+    rrf_k: int = 60,
+    fusion_list_k: int | None = None,
 ) -> Tuple[List[str], List[str]]:
     """
-    ``pool``: FAISS top-``retrieve_k`` passages (before rerank).
+    ``pool``: FAISS top-``retrieve_k`` passages (before rerank), or hybrid BM25+dense+RRF if ``bm25_resources`` is set.
     ``final``: passages passed to the LLM (after rerank or slice to ``final_k``).
     """
     k = min(retrieve_k, len(corpus_chunks))
     if k <= 0:
         return [], []
-    q = prepare_query(embedder.name, question)
-    q_emb = embedder.encode([q])
-    _, idx = search(faiss_index, q_emb, top_k=k)
-    pool = gather_texts_by_indices(corpus_chunks, idx[0].tolist())
+    if bm25_resources is not None:
+        pool = retrieve_hybrid_pool(
+            question,
+            embedder=embedder,
+            corpus_chunks=corpus_chunks,
+            faiss_index=faiss_index,
+            bm25_resources=bm25_resources,
+            retrieve_k=k,
+            rrf_k=rrf_k,
+            fusion_list_k=fusion_list_k,
+        )
+    else:
+        q = prepare_query(embedder.name, question)
+        q_emb = embedder.encode([q])
+        _, idx = search(faiss_index, q_emb, top_k=k)
+        pool = gather_texts_by_indices(corpus_chunks, idx[0].tolist())
 
     if reranker is not None:
         final_texts, _ = reranker.rerank(
@@ -105,8 +121,11 @@ def retrieve_passages_for_query(
     retrieve_k: int,
     reranker: Optional[Reranker] = None,
     final_k: int = 3,
+    bm25_resources: Optional[BM25Resources] = None,
+    rrf_k: int = 60,
+    fusion_list_k: int | None = None,
 ) -> List[str]:
-    """Retrieve up to `retrieve_k` from FAISS; optionally rerank down to `final_k` passages."""
+    """Retrieve up to ``retrieve_k`` (dense or hybrid+RRF); optionally rerank down to ``final_k`` passages."""
     _, final_texts = retrieve_passages_pool_and_final(
         question,
         embedder,
@@ -115,6 +134,9 @@ def retrieve_passages_for_query(
         retrieve_k=retrieve_k,
         reranker=reranker,
         final_k=final_k,
+        bm25_resources=bm25_resources,
+        rrf_k=rrf_k,
+        fusion_list_k=fusion_list_k,
     )
     return final_texts
 

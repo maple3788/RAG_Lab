@@ -14,6 +14,7 @@ from src.embedder import EmbeddingModel
 from src.generator import TextGenerator
 from src.loader import QAExample
 from src.prompts import format_rag_prompt
+from src.hybrid_retrieval import build_bm25_resources
 from src.rag_pipeline import (
     build_corpus_chunks_from_documents,
     build_retrieval_index,
@@ -40,6 +41,11 @@ class RAGGenerationConfig:
     per_example_retrieval: bool = False
     chunk_size: int = 512
     chunk_overlap: int = 64
+    #: BM25 + dense RRF pool (per-example corpus only); ignored unless ``per_example_retrieval``.
+    use_hybrid: bool = False
+    #: Candidates per retriever before RRF; ``None`` = use full corpus (capped by chunk count).
+    fusion_list_k: Optional[int] = None
+    rrf_k: int = 60
 
 
 def evaluate_rag_answer_quality(
@@ -81,6 +87,14 @@ def evaluate_rag_answer_quality(
                 hits.append(0.0)
                 continue
             fi = build_retrieval_index(embedder, chunks)
+            bm25 = (
+                build_bm25_resources(chunks)
+                if config.use_hybrid
+                else None
+            )
+            fusion = config.fusion_list_k
+            if bm25 is not None and fusion is None:
+                fusion = len(chunks)
             passages = retrieve_passages_for_query(
                 ex.question,
                 embedder,
@@ -89,6 +103,9 @@ def evaluate_rag_answer_quality(
                 retrieve_k=config.retrieve_k,
                 reranker=reranker if config.use_rerank else None,
                 final_k=config.final_k,
+                bm25_resources=bm25,
+                rrf_k=config.rrf_k,
+                fusion_list_k=fusion,
             )
         else:
             passages = retrieve_passages_for_query(

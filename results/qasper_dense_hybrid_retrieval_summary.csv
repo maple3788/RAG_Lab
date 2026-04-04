@@ -1,0 +1,2 @@
+n_questions,gold_hit_pool_dense,gold_hit_pool_hybrid,gold_hit_final_dense,gold_hit_final_hybrid,n_hybrid_recovered,n_hybrid_lost
+200.0,0.945,0.955,0.735,0.755,2.0,0.0
