@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Iterator, Protocol, runtime_checkable
 
 from dotenv import load_dotenv
 
@@ -17,6 +17,23 @@ def _load_project_dotenv() -> None:
 @runtime_checkable
 class TextGenerator(Protocol):
     def generate(self, prompt: str) -> str: ...
+
+
+@runtime_checkable
+class StreamingTextGenerator(Protocol):
+    def generate_stream(self, prompt: str) -> Iterator[str]: ...
+
+
+@runtime_checkable
+class ChatTextGenerator(Protocol):
+    def generate_chat(self, *, system_prompt: str, user_prompt: str) -> str: ...
+
+
+@runtime_checkable
+class StreamingChatTextGenerator(Protocol):
+    def generate_chat_stream(
+        self, *, system_prompt: str, user_prompt: str
+    ) -> Iterator[str]: ...
 
 
 @dataclass
@@ -67,6 +84,22 @@ class GeminiGenerator:
         text = getattr(resp, "text", None) or ""
         return text.strip()
 
+    def generate_stream(self, prompt: str) -> Iterator[str]:
+        from google.genai import types
+
+        stream = self._client.models.generate_content_stream(
+            model=self.model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=self.temperature,
+                max_output_tokens=self.max_output_tokens,
+            ),
+        )
+        for chunk in stream:
+            text = getattr(chunk, "text", None) or ""
+            if text:
+                yield text
+
 
 @dataclass
 class OpenAICompatibleGenerator:
@@ -102,6 +135,57 @@ class OpenAICompatibleGenerator:
         choice = resp.choices[0]
         content = choice.message.content
         return (content or "").strip()
+
+    def generate_chat(self, *, system_prompt: str, user_prompt: str) -> str:
+        resp = self._client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+        )
+        choice = resp.choices[0]
+        content = choice.message.content
+        return (content or "").strip()
+
+    def generate_stream(self, prompt: str) -> Iterator[str]:
+        stream = self._client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            stream=True,
+        )
+        for event in stream:
+            if not event.choices:
+                continue
+            delta = event.choices[0].delta
+            text = getattr(delta, "content", None) or ""
+            if text:
+                yield text
+
+    def generate_chat_stream(
+        self, *, system_prompt: str, user_prompt: str
+    ) -> Iterator[str]:
+        stream = self._client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            stream=True,
+        )
+        for event in stream:
+            if not event.choices:
+                continue
+            delta = event.choices[0].delta
+            text = getattr(delta, "content", None) or ""
+            if text:
+                yield text
 
 
 @dataclass
@@ -140,6 +224,57 @@ class OllamaGenerator:
         content = choice.message.content
         return (content or "").strip()
 
+    def generate_chat(self, *, system_prompt: str, user_prompt: str) -> str:
+        resp = self._client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+        )
+        choice = resp.choices[0]
+        content = choice.message.content
+        return (content or "").strip()
+
+    def generate_stream(self, prompt: str) -> Iterator[str]:
+        stream = self._client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            stream=True,
+        )
+        for event in stream:
+            if not event.choices:
+                continue
+            delta = event.choices[0].delta
+            text = getattr(delta, "content", None) or ""
+            if text:
+                yield text
+
+    def generate_chat_stream(
+        self, *, system_prompt: str, user_prompt: str
+    ) -> Iterator[str]:
+        stream = self._client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            stream=True,
+        )
+        for event in stream:
+            if not event.choices:
+                continue
+            delta = event.choices[0].delta
+            text = getattr(delta, "content", None) or ""
+            if text:
+                yield text
+
 
 @dataclass
 class MockGenerator:
@@ -159,3 +294,6 @@ class MockGenerator:
                 if line:
                     return line[:200]
         return "unknown"
+
+    def generate_stream(self, prompt: str) -> Iterator[str]:
+        yield self.generate(prompt)
