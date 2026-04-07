@@ -25,6 +25,8 @@ Context:
 Q: {question}
 A:""",
     "strict_cite": """Answer only using information from the context below. If the answer is not in the context, say "unknown".
+Every factual claim must include at least one citation in [n] format where n is the passage number.
+If multiple passages support the answer, include multiple citations like [1][3].
 
 History:
 {history}
@@ -33,7 +35,7 @@ Context:
 {context}
 
 Question: {question}
-Your answer (short):""",
+Your answer (short, with citations):""",
 }
 
 

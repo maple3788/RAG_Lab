@@ -48,6 +48,13 @@ def run_compare_rerank(embedder, corpus_chunks, examples, generator, base: RAGGe
             per_example_retrieval=base.per_example_retrieval,
             chunk_size=base.chunk_size,
             chunk_overlap=base.chunk_overlap,
+            use_hybrid=base.use_hybrid,
+            fusion_list_k=base.fusion_list_k,
+            rrf_k=base.rrf_k,
+            use_semantic_cache=base.use_semantic_cache,
+            semantic_cache_threshold=base.semantic_cache_threshold,
+            semantic_cache_max_entries=base.semantic_cache_max_entries,
+            rewrite_on_empty_retrieval=base.rewrite_on_empty_retrieval,
         )
         m = evaluate_rag_answer_quality(
             examples,
@@ -76,6 +83,13 @@ def run_compare_topk(embedder, corpus_chunks, examples, generator, base: RAGGene
             per_example_retrieval=base.per_example_retrieval,
             chunk_size=base.chunk_size,
             chunk_overlap=base.chunk_overlap,
+            use_hybrid=base.use_hybrid,
+            fusion_list_k=base.fusion_list_k,
+            rrf_k=base.rrf_k,
+            use_semantic_cache=base.use_semantic_cache,
+            semantic_cache_threshold=base.semantic_cache_threshold,
+            semantic_cache_max_entries=base.semantic_cache_max_entries,
+            rewrite_on_empty_retrieval=base.rewrite_on_empty_retrieval,
         )
         m = evaluate_rag_answer_quality(
             examples,
@@ -104,6 +118,13 @@ def run_compare_prompts(embedder, corpus_chunks, examples, generator, base: RAGG
             per_example_retrieval=base.per_example_retrieval,
             chunk_size=base.chunk_size,
             chunk_overlap=base.chunk_overlap,
+            use_hybrid=base.use_hybrid,
+            fusion_list_k=base.fusion_list_k,
+            rrf_k=base.rrf_k,
+            use_semantic_cache=base.use_semantic_cache,
+            semantic_cache_threshold=base.semantic_cache_threshold,
+            semantic_cache_max_entries=base.semantic_cache_max_entries,
+            rewrite_on_empty_retrieval=base.rewrite_on_empty_retrieval,
         )
         m = evaluate_rag_answer_quality(
             examples,
@@ -141,6 +162,13 @@ def run_compare_truncation(
             per_example_retrieval=base.per_example_retrieval,
             chunk_size=base.chunk_size,
             chunk_overlap=base.chunk_overlap,
+            use_hybrid=base.use_hybrid,
+            fusion_list_k=base.fusion_list_k,
+            rrf_k=base.rrf_k,
+            use_semantic_cache=base.use_semantic_cache,
+            semantic_cache_threshold=base.semantic_cache_threshold,
+            semantic_cache_max_entries=base.semantic_cache_max_entries,
+            rewrite_on_empty_retrieval=base.rewrite_on_empty_retrieval,
         )
         m = evaluate_rag_answer_quality(
             examples,
@@ -170,6 +198,10 @@ def main() -> None:
     parser.add_argument("--retrieve-k", type=int, default=10, help="FAISS top-k when reranking")
     parser.add_argument("--final-k", type=int, default=3, help="Passages fed to the LLM after retrieve/rerank")
     parser.add_argument("--max-context-chars", type=int, default=6000)
+    parser.add_argument("--use-semantic-cache", action="store_true")
+    parser.add_argument("--semantic-cache-threshold", type=float, default=0.93)
+    parser.add_argument("--semantic-cache-max-entries", type=int, default=512)
+    parser.add_argument("--rewrite-on-empty-retrieval", action="store_true")
     parser.add_argument(
         "--truncation-chars",
         type=int,
@@ -227,6 +259,10 @@ def main() -> None:
         per_example_retrieval=False,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
+        use_semantic_cache=bool(args.use_semantic_cache),
+        semantic_cache_threshold=float(args.semantic_cache_threshold),
+        semantic_cache_max_entries=int(args.semantic_cache_max_entries),
+        rewrite_on_empty_retrieval=bool(args.rewrite_on_empty_retrieval),
     )
 
     reranker = None

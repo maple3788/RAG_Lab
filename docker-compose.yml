@@ -1,27 +1,20 @@
-# Local stack for ingest (`demo/app.py` → workflow "Ingest"): **same MinIO build you already use** (AiStor) + Redis.
+# Local stack for ingest (`demo/app.py` → workflow "Ingest"): MinIO Community + Redis.
 #
 #   docker compose up -d
 #
-# Uses `quay.io/minio/aistor/minio:latest` — not `minio/minio`, so you are not maintaining
-# two different object-store images. If you already start MinIO/AiStor manually, stop that
-# container first (or it will conflict on :9000 / :9001), then let Compose own the lifecycle.
+# Uses `minio/minio` (community image; no enterprise license required).
 #
-# API: https://localhost:9000 or http://localhost:9000 (depends on TLS setup in the image)
+# API: http://localhost:9000
 # Console: :9001 · credentials minioadmin / minioadmin (unless you override env)
-#
-# Some AiStor deployments need a license file. If the container exits, add a volume and
-# `--license` per https://docs.min.io/enterprise/aistor-object-store/installation/container/install/
-#
-# .env for plain HTTP to this service:
+# .env for this service:
 #   MINIO_ENDPOINT=localhost:9000
 #   MINIO_USE_SSL=false
 #   REDIS_URL=redis://localhost:6379/0
 
 services:
   minio:
-    image: quay.io/minio/aistor/minio:latest
-    # Same argv style as `docker run … quay.io/minio/aistor/minio:latest minio server /mnt/data …`
-    command: ["minio", "server", "/mnt/data", "--console-address", ":9001"]
+    image: minio/minio:latest
+    command: ["server", "/mnt/data", "--console-address", ":9001"]
     ports:
       - "9000:9000"
       - "9001:9001"

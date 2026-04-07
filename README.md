@@ -38,6 +38,36 @@ flowchart TD
     I --> J[Final Output & Evaluation Metrics]
 ```
 
+### Production RAG blueprint (quality + latency)
+
+Use this as a practical target operating model when moving from experiments to production traffic.
+
+| Stage | Default target | Why it helps |
+|---|---|---|
+| Retrieval | Strong embedding model + optional hybrid BM25 fusion | Dense retrieval captures semantics; sparse retrieval catches exact terms/acronyms |
+| Candidate pool | `vdb_top_k = 50-100` | Broad first pass improves recall before expensive filtering |
+| Rerank | Cross-encoder, `reranker_top_k = 3-5` | Improves precision of final context sent to generation |
+| Query rewrite | Conditional only (fallback path) | Avoids extra LLM latency unless first-pass retrieval is weak |
+| Generation | Strict grounding + explicit source citations | Reduces hallucinations and improves answer trust |
+| UX latency | Stream tokens immediately | Improves time-to-first-token and perceived responsiveness |
+| Scale | Shard/vector-service split when corpus is large | Keeps p95 retrieval latency stable as chunk count grows |
+| Cost control | Semantic cache for repeated questions | Skips repeated retrieval/generation for hot intents |
+
+### RAG hardening checklist
+
+Use this checklist to evolve the current lab pipeline without breaking experiment reproducibility.
+
+- [ ] **Retrieval quality baseline:** run `exp_trec_covid.py` and `exp_qasper_hybrid_compare.py` to set recall/IR baselines before changing models.
+- [ ] **Two-stage retrieval bounds:** keep broad retrieval (`retrieve_k`) and narrow final context (`final_k`) explicit in all generation experiments.
+- [ ] **Hybrid retrieval gate:** enable BM25+RRF for datasets where entities/tables/numeric strings are common; keep dense-only as control.
+- [ ] **Conditional rewrite policy:** add a fallback rewrite/decomposition step only when first-pass retrieval confidence is below threshold.
+- [ ] **Citation-first prompting:** prefer strict cite templates for high-stakes QA; track any EM/F1 trade-off against faithfulness gains.
+- [ ] **Streaming output path:** enable token streaming in interactive surfaces (e.g., demo app) to reduce perceived latency.
+- [ ] **Per-stage latency telemetry:** log timers for embed, retrieve, rerank, prompt-build, generation; report p50/p95 by run.
+- [ ] **Grounding eval cadence:** run RAGAS (`exp_ragas_eval.py`, `exp_ragas_financebench.py`) on a fixed sample each change window.
+- [ ] **Reliability guardrails:** define an error budget (example: 99% queries under 2s in chosen environment) and pause feature work when violated.
+- [ ] **Scale migration trigger:** when in-memory FAISS no longer meets latency/throughput targets, move retrieval to a managed/sharded vector backend while preserving chunking/eval harness.
+
 ### Hybrid retrieval (BM25 + dense)
 
 For long documents, **dense-only** FAISS search can miss chunks that match lexically (tables, numbers, rare tokens). Optional **hybrid** retrieval builds a **BM25** index over the same chunks and merges dense + sparse rankings with **Reciprocal Rank Fusion (RRF)** (`src/hybrid_retrieval.py`, dependency `rank-bm25`).
@@ -64,6 +94,12 @@ Three sidebar views: **Ingest** (run pipeline → MinIO + Redis), **Query** (RAG
 ```
 
 Use the **project venv** so `sentence_transformers` / `torch` match. `.streamlit/config.toml` disables file-watching to reduce Hugging Face `transformers` log noise; refresh the browser after code edits.
+
+**Milvus + Redis in Query mode (new):**
+- In **Query → Options**, set **Vector DB backend = `milvus`**.
+- Click **Sync loaded job to Milvus** once after loading a job.
+- Enable **Redis semantic cache** to reuse answers for semantically similar questions.
+- Configure with `.env`: `MILVUS_URI`, `MILVUS_TOKEN` (optional), `MILVUS_COLLECTION`, `REDIS_URL`.
 
 **Session vs persisted index:** RAG state (FAISS + chunks) lives **in process memory** while Streamlit runs. To reuse a corpus across restarts, run **Ingest** once, then in **Query** attach a **`job_id`** and **Load** so chunks and `faiss.index` are pulled from MinIO again.
 
@@ -111,6 +147,13 @@ python experiments/exp_rerank.py
 ```bash
 python experiments/exp_rag_generation.py --mode all
 # ollama pull llama3.2 && python experiments/exp_rag_generation.py --mode all --llm-backend ollama
+
+# RAGAS evaluation (install first: pip install ragas datasets)
+python experiments/exp_ragas_eval.py --data-path datasets/qa_dataset.jsonl --max-examples 100 --llm-backend ollama
+# FinanceBench + RAGAS (clone first: https://github.com/patronus-ai/financebench)
+python experiments/exp_ragas_financebench.py --financebench-root data/financebench --max-examples 100 --llm-backend ollama
+# Gemini evaluator (install: pip install langchain-google-genai, set GEMINI_API_KEY)
+# python experiments/exp_ragas_financebench.py --financebench-root data/financebench --max-examples 30 --llm-backend gemini --llm-model gemini-2.5-flash --ragas-eval-model gemini-2.5-flash
 ```
 
 Modes → `results/rag_generation_results.csv`: `compare-rerank`, `compare-topk`, `compare-prompts`, `compare-truncation`, `all`.
@@ -119,6 +162,9 @@ Modes → `results/rag_generation_results.csv`: `compare-rerank`, `compare-topk`
 python experiments/exp_rag_generation_trec.py --data-dir data/trec-covid --mode all --llm-backend ollama
 python experiments/exp_rag_generation_triviaqa.py --split validation --max-examples 200 --mode all --llm-backend ollama
 python experiments/exp_rag_generation_qasper.py --split validation --max-examples 200 --mode all --llm-backend ollama
+# FinanceBench open-source (clone patronus-ai/financebench first)
+# git clone https://github.com/patronus-ai/financebench data/financebench
+python experiments/exp_rag_generation_financebench.py --financebench-root data/financebench --mode all --llm-backend ollama --max-examples 100
 
 # QASPER: dense FAISS vs BM25+dense (RRF) — retrieval oracle (gold alias in chunks), no LLM by default
 python experiments/exp_qasper_hybrid_compare.py --mode retrieval --max-examples 200

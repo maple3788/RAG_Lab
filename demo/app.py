@@ -10,15 +10,38 @@ from __future__ import annotations
 
 import logging
 import html
+import math
+import os
 import re
 import time
 import warnings
+from time import perf_counter
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-warnings.filterwarnings("ignore", message=r"Accessing `__path__`")
-logging.getLogger("transformers").setLevel(logging.ERROR)
-logging.getLogger("transformers.models").setLevel(logging.ERROR)
+# Quiet Python warnings (deprecations, ragas, torch, etc.) in the Streamlit terminal.
+warnings.simplefilter("ignore")
+os.environ.setdefault("PYTHONWARNINGS", "ignore")
+
+if not logging.root.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+# Third-party chatter → errors only; app/RAGAS loggers stay at INFO via basicConfig.
+for _noisy in (
+    "transformers",
+    "transformers.models",
+    "urllib3",
+    "urllib3.connectionpool",
+    "httpx",
+    "httpcore",
+    "asyncio",
+    "PIL",
+    "faiss",
+):
+    logging.getLogger(_noisy).setLevel(logging.ERROR)
 
 import sys
 
@@ -56,8 +79,11 @@ from src.rag_generation import passages_to_context
 from src.reranker import Reranker, load_reranker
 from src.retriever import FaissIndex, search
 from src.storage.minio_artifacts import MinioArtifactStore, load_minio_settings
+from src.storage.milvus_store import MilvusChunkStore
 from src.storage.redis_jobs import RedisJobStore
+from src.storage.redis_semantic_cache import RedisSemanticCache
 from src.streaming_parser import HiddenReasoningStreamParser, strip_hidden_reasoning_text
+from src.ragas_ui_metrics import run_ragas_legacy_evaluate
 
 
 DEFAULT_EMBED = "BAAI/bge-base-en-v1.5"
@@ -84,6 +110,15 @@ def cached_reranker(model_name: str) -> Reranker:
 
 def _minio_store() -> MinioArtifactStore:
     return MinioArtifactStore(load_minio_settings())
+
+
+def _milvus_store() -> MilvusChunkStore:
+    """
+    Do not cache_resource: Milvus may be offline; cached init would show
+    "Running _milvus_store()" and block until connect completes.
+    Connect timeout is set via MILVUS_CONNECT_TIMEOUT (see MilvusSettings).
+    """
+    return MilvusChunkStore()
 
 
 def make_generator(backend: str) -> TextGenerator:
@@ -136,6 +171,12 @@ def cross_encoder_rerank_trace(
 def _sanitize_singleline(text: str) -> str:
     s = " ".join((text or "").strip().split())
     return s
+
+
+def _trace_text_area_height(text: str, *, cap: int = 240) -> int:
+    """Streamlit ``st.text_area`` requires height >= 68px."""
+    h = 24 + 12 * (text or "").count("\n")
+    return max(68, min(cap, h))
 
 
 def _compose_chat_prompt(system_prompt: str, user_prompt: str) -> str:
@@ -562,7 +603,21 @@ def _retrieve_rows_for_query(
     corpus_chunks: List[str],
     faiss_index: FaissIndex,
     top_k: int,
+    vdb_backend: str = "faiss",
+    milvus_store: Optional[MilvusChunkStore] = None,
+    milvus_job_id: Optional[str] = None,
 ) -> List[dict]:
+    if (
+        vdb_backend == "milvus"
+        and milvus_store is not None
+        and milvus_job_id
+    ):
+        return milvus_store.search_job_chunks(
+            job_id=milvus_job_id,
+            query=query,
+            embedder=embedder,
+            top_k=top_k,
+        )
     q = prepare_query(embedder.name, query)
     q_emb = embedder.encode([q])
     faiss_scores, idx = search(faiss_index, q_emb, top_k=top_k)
@@ -610,6 +665,12 @@ def run_pipeline(
     max_reflection_loops: int = 2,
     require_citations: bool = False,
     history: str = "None",
+    vdb_backend: str = "faiss",
+    milvus_store: Optional[MilvusChunkStore] = None,
+    milvus_job_id: Optional[str] = None,
+    semantic_cache: Optional[RedisSemanticCache] = None,
+    semantic_cache_threshold: float = 0.93,
+    semantic_cache_max_entries: int = 512,
 ) -> dict:
     k = min(retrieve_k, len(corpus_chunks))
     llm_details = get_generator_details(generator)
@@ -618,6 +679,7 @@ def run_pipeline(
         {
             "stage": "input",
             "title": "Input question",
+            "latency_ms": 0.0,
             "input": {"question": question},
             "output": {
                 "llm": llm_details,
@@ -644,6 +706,23 @@ def run_pipeline(
             "raw_context": "",
         }
 
+    t_all = perf_counter()
+    stage_latencies: Dict[str, float] = {}
+
+    t_stage = perf_counter()
+    cache_hit = False
+    cached_answer: Optional[str] = None
+    if semantic_cache is not None:
+        q0 = prepare_query(embedder.name, question)
+        q0_emb = embedder.encode([q0])[0]
+        cached_answer = semantic_cache.lookup(
+            q0_emb, threshold=float(semantic_cache_threshold)
+        )
+        if cached_answer:
+            cache_hit = True
+    stage_latencies["semantic_cache_lookup_ms"] = (perf_counter() - t_stage) * 1000.0
+
+    t_stage = perf_counter()
     rewritten_question = question
     rewrite_debug: dict[str, Any] = {
         "prompt": None,
@@ -654,10 +733,12 @@ def run_pipeline(
         rewritten_question, rewrite_debug = rewrite_query_with_llm(
             question, generator=generator, history=history, debug=True
         )  # type: ignore[assignment]
+    stage_latencies["query_rewrite_ms"] = (perf_counter() - t_stage) * 1000.0
     stage_trace.append(
         {
             "stage": "query_rewrite",
             "title": "Query rewrite",
+            "latency_ms": round(stage_latencies["query_rewrite_ms"], 2),
             "input": {"question": question, "enabled": use_query_rewrite},
             "output": {
                 "rewritten_question": rewritten_question,
@@ -666,6 +747,7 @@ def run_pipeline(
         }
     )
 
+    t_stage = perf_counter()
     retrieval_queries: List[str] = [rewritten_question]
     decompose_debug: dict[str, Any] = {
         "prompt": None,
@@ -684,10 +766,12 @@ def run_pipeline(
             if sq.lower() == rewritten_question.lower():
                 continue
             retrieval_queries.append(sq)
+    stage_latencies["query_decomposition_ms"] = (perf_counter() - t_stage) * 1000.0
     stage_trace.append(
         {
             "stage": "query_decomposition",
             "title": "Query decomposition",
+            "latency_ms": round(stage_latencies["query_decomposition_ms"], 2),
             "input": {
                 "rewritten_question": rewritten_question,
                 "enabled": use_query_decomposition,
@@ -700,6 +784,7 @@ def run_pipeline(
         }
     )
 
+    t_stage = perf_counter()
     merged: Dict[int, dict] = {}
     for rq in retrieval_queries:
         rows = _retrieve_rows_for_query(
@@ -708,6 +793,9 @@ def run_pipeline(
             corpus_chunks=corpus_chunks,
             faiss_index=faiss_index,
             top_k=k,
+            vdb_backend=vdb_backend,
+            milvus_store=milvus_store,
+            milvus_job_id=milvus_job_id,
         )
         for row in rows:
             ci = int(row["chunk_index"])
@@ -732,10 +820,12 @@ def run_pipeline(
     )
     for i, row in enumerate(retrieved_all, start=1):
         row["faiss_rank"] = i
+    stage_latencies["dense_retrieval_ms"] = (perf_counter() - t_stage) * 1000.0
     stage_trace.append(
         {
             "stage": "dense_retrieval",
             "title": "Dense retrieval + merge",
+            "latency_ms": round(stage_latencies["dense_retrieval_ms"], 2),
             "input": {"retrieval_queries": retrieval_queries, "top_k_each": k},
             "output": {
                 "n_unique_chunks": len(retrieved_all),
@@ -752,6 +842,7 @@ def run_pipeline(
         }
     )
 
+    t_stage = perf_counter()
     retrieval_filter = {"include": [], "exclude": []}
     filter_debug: dict[str, Any] = {
         "prompt": None,
@@ -770,10 +861,12 @@ def run_pipeline(
         )
         for i, row in enumerate(retrieved, start=1):
             row["faiss_rank"] = i
+    stage_latencies["filter_generation_ms"] = (perf_counter() - t_stage) * 1000.0
     stage_trace.append(
         {
             "stage": "filter_generation",
             "title": "Filter generation",
+            "latency_ms": round(stage_latencies["filter_generation_ms"], 2),
             "input": {
                 "enabled": use_filter_generation,
                 "query": rewritten_question,
@@ -792,15 +885,18 @@ def run_pipeline(
     rerank_rows: List[dict] = []
     final_passages: List[str] = []
 
+    t_stage = perf_counter()
     if use_rerank and reranker is not None and pool:
         rerank_rows = cross_encoder_rerank_trace(reranker, rewritten_question, pool)
         final_passages = [r["text"] for r in rerank_rows[: min(final_k, len(rerank_rows))]]
     else:
         final_passages = pool[: min(final_k, len(pool))]
+    stage_latencies["rerank_ms"] = (perf_counter() - t_stage) * 1000.0
     stage_trace.append(
         {
             "stage": "rerank",
             "title": "Rerank / final passage selection",
+            "latency_ms": round(stage_latencies["rerank_ms"], 2),
             "input": {
                 "enabled": use_rerank,
                 "pool_size": len(pool),
@@ -814,13 +910,11 @@ def run_pipeline(
         }
     )
 
-    def _build_answer(
+    def _compose_rag_prompt_parts(
         passages: List[str],
         q_for_prompt: str,
-        *,
-        on_stream: Optional[Callable[[str], None]] = None,
-        on_raw_stream: Optional[Callable[[str], None]] = None,
-    ) -> tuple[str, str, str, str]:
+    ) -> tuple[str, str, str]:
+        """Build the same user prompt + combined prompt string used for generation (for display)."""
         raw_ctx = passages_to_context(passages)
         context = truncate_context(raw_ctx, max_context_chars, truncation)
         effective_user_template = prompt_template
@@ -836,6 +930,16 @@ def run_pipeline(
             history=history,
         )
         prompt_val = _compose_chat_prompt(RAG_SYSTEM_PROMPT, user_prompt)
+        return raw_ctx, user_prompt, prompt_val
+
+    def _build_answer(
+        passages: List[str],
+        q_for_prompt: str,
+        *,
+        on_stream: Optional[Callable[[str], None]] = None,
+        on_raw_stream: Optional[Callable[[str], None]] = None,
+    ) -> tuple[str, str, str, str]:
+        raw_ctx, user_prompt, prompt_val = _compose_rag_prompt_parts(passages, q_for_prompt)
         answer_val = generate_visible_answer(
             generator=generator,
             system_prompt=RAG_SYSTEM_PROMPT,
@@ -846,11 +950,33 @@ def run_pipeline(
         )
         return raw_ctx, user_prompt, prompt_val, answer_val
 
-    raw_context, user_prompt, prompt, answer = _build_answer(final_passages, rewritten_question)
+    t_stage = perf_counter()
+    raw_context, user_prompt, prompt = _compose_rag_prompt_parts(
+        final_passages, rewritten_question
+    )
+    stage_latencies["prompt_build_ms"] = (perf_counter() - t_stage) * 1000.0
+
+    t_stage = perf_counter()
+    if cache_hit and cached_answer is not None:
+        answer = cached_answer
+    else:
+        answer = generate_visible_answer(
+            generator=generator,
+            system_prompt=RAG_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            prompt=prompt,
+            on_visible_text=None,
+            on_raw_text=None,
+        )
+    stage_latencies["generation_llm_ms"] = (perf_counter() - t_stage) * 1000.0
+    gen_lat = round(
+        stage_latencies["prompt_build_ms"] + stage_latencies["generation_llm_ms"], 2
+    )
     stage_trace.append(
         {
             "stage": "generation",
             "title": "Prompt + generation",
+            "latency_ms": gen_lat,
             "input": {
                 "question_for_prompt": rewritten_question,
                 "prompt_template": prompt_template[:180],
@@ -858,6 +984,9 @@ def run_pipeline(
                 "truncation": truncation,
             },
             "output": {
+                "cache_hit": cache_hit,
+                "prompt_build_ms": round(stage_latencies["prompt_build_ms"], 2),
+                "generation_llm_ms": round(stage_latencies["generation_llm_ms"], 2),
                 "raw_context_chars": len(raw_context),
                 "prompt_chars": len(prompt),
                 "answer_preview": answer[:500],
@@ -874,6 +1003,7 @@ def run_pipeline(
 
     reflection_steps: List[dict] = []
     seen_reflection_queries = {q.lower() for q in retrieval_queries}
+    t_refl = perf_counter()
     if use_reflection_loops and max_reflection_loops > 0:
         for i in range(int(max_reflection_loops)):
             followup, refl_debug = reflection_followup_query(
@@ -909,6 +1039,9 @@ def run_pipeline(
                 corpus_chunks=corpus_chunks,
                 faiss_index=faiss_index,
                 top_k=k,
+                vdb_backend=vdb_backend,
+                milvus_store=milvus_store,
+                milvus_job_id=milvus_job_id,
             )
             added = 0
             for row in new_rows:
@@ -968,10 +1101,12 @@ def run_pipeline(
                     "llm_call": {"system_prompt": None, **refl_debug},
                 }
             )
+        stage_latencies["reflection_ms"] = (perf_counter() - t_refl) * 1000.0
         stage_trace.append(
             {
                 "stage": "reflection",
                 "title": "Reflection loops",
+                "latency_ms": round(stage_latencies["reflection_ms"], 2),
                 "input": {
                     "enabled": use_reflection_loops,
                     "max_reflection_loops": max_reflection_loops,
@@ -980,10 +1115,12 @@ def run_pipeline(
             }
         )
     else:
+        stage_latencies["reflection_ms"] = 0.0
         stage_trace.append(
             {
                 "stage": "reflection",
                 "title": "Reflection loops",
+                "latency_ms": 0.0,
                 "input": {
                     "enabled": use_reflection_loops,
                     "max_reflection_loops": max_reflection_loops,
@@ -1005,12 +1142,30 @@ def run_pipeline(
             }
         )
 
+    t_stage = perf_counter()
     cited_ids = _extract_citation_ids(answer)
     cited_rows = [r for r in citation_table if int(r["id"]) in cited_ids]
+    stage_latencies["citations_ms"] = (perf_counter() - t_stage) * 1000.0
+    stage_trace.append(
+        {
+            "stage": "semantic_cache",
+            "title": "Semantic cache",
+            "latency_ms": round(stage_latencies["semantic_cache_lookup_ms"], 2),
+            "input": {
+                "enabled": semantic_cache is not None,
+                "threshold": semantic_cache_threshold,
+            },
+            "output": {
+                "cache_hit": cache_hit,
+                "lookup_ms": round(stage_latencies["semantic_cache_lookup_ms"], 2),
+            },
+        }
+    )
     stage_trace.append(
         {
             "stage": "citations",
             "title": "Citation extraction",
+            "latency_ms": round(stage_latencies["citations_ms"], 2),
             "input": {"answer_preview": answer[:500]},
             "output": {
                 "citation_ids": cited_ids,
@@ -1026,6 +1181,20 @@ def run_pipeline(
         }
     )
 
+    t_stage = perf_counter()
+    if semantic_cache is not None and not cache_hit:
+        q0 = prepare_query(embedder.name, question)
+        q0_emb = embedder.encode([q0])[0]
+        semantic_cache.write(
+            question=question,
+            answer=answer,
+            query_embedding=q0_emb,
+            max_entries=int(semantic_cache_max_entries),
+        )
+    stage_latencies["semantic_cache_write_ms"] = (perf_counter() - t_stage) * 1000.0
+
+    latency_total_ms = (perf_counter() - t_all) * 1000.0
+
     return {
         "error": None,
         "retrieved": retrieved,
@@ -1040,12 +1209,15 @@ def run_pipeline(
         "original_question": question,
         "rewritten_question": rewritten_question,
         "stage_trace": stage_trace,
+        "stage_latencies": {k: round(float(v), 2) for k, v in stage_latencies.items()},
+        "latency_total_ms": round(latency_total_ms, 2),
         "prompt": prompt,
         "answer": answer,
         "raw_context": raw_context,
         "truncation": truncation,
         "max_context_chars": max_context_chars,
         "use_rerank": use_rerank,
+        "cache_hit": cache_hit,
     }
 
 
@@ -1079,7 +1251,7 @@ def render_rag_trace(result: dict, *, ui_id: int, final_k: int) -> None:
                 st.text_area(
                     "Chunk",
                     row["text"],
-                    height=min(240, 24 + 12 * row["text"].count("\n")),
+                    height=_trace_text_area_height(row["text"], cap=240),
                     key=f"{ui_id}_c_{row['faiss_rank']}_{row['chunk_index']}",
                     label_visibility="collapsed",
                 )
@@ -1095,18 +1267,23 @@ def render_rag_trace(result: dict, *, ui_id: int, final_k: int) -> None:
                     st.text_area(
                         "Passage",
                         row["text"],
-                        height=min(240, 24 + 12 * row["text"].count("\n")),
+                        height=_trace_text_area_height(row["text"], cap=240),
                         key=f"{ui_id}_r_{row['new_rank']}",
                         label_visibility="collapsed",
                     )
             st.caption(f"Passages 1–{min(fk, len(result['rerank_rows']))} → LLM context.")
 
     with tab_prompt:
+        if result.get("cache_hit"):
+            st.caption(
+                "Answer from **Redis semantic cache** (no LLM call). "
+                "Prompt below is the same RAG prompt built from retrieved context."
+            )
         st.caption(
             f"Context ~{len(result.get('raw_context', ''))} chars · "
             f"truncation **{result['truncation']}** → **{result['max_context_chars']}**"
         )
-        st.text_area("Prompt", result["prompt"], height=360, key=f"{ui_id}_p")
+        st.text_area("Prompt", result.get("prompt") or "", height=360, key=f"{ui_id}_p")
         st.write("**Answer (repeat)**")
         st.write(result["answer"])
         steps = result.get("reflection_steps", [])
@@ -1128,10 +1305,180 @@ def render_rag_trace(result: dict, *, ui_id: int, final_k: int) -> None:
                     st.text_area(
                         "Source",
                         row["text"],
-                        height=min(220, 24 + 12 * row["text"].count("\n")),
+                        height=_trace_text_area_height(row["text"], cap=220),
                         key=f"{ui_id}_cite_{row['id']}",
                         label_visibility="collapsed",
                     )
+
+
+def _default_ragas_eval_model(backend: str) -> str:
+    """Default evaluator model id (LangChain chat; match typical chat defaults in this app)."""
+    if backend == "openai":
+        return "gpt-4o-mini"
+    if backend == "ollama":
+        return "llama3.2"
+    if backend == "gemini":
+        return "gemini-2.5-flash"
+    return "gpt-4o-mini"
+
+
+def _ragas_score_cell(raw: Any, err: Optional[str]) -> str:
+    """Format a metric value; show N/A + reason when missing or non-finite (e.g. NaN)."""
+    if raw is None:
+        return f"N/A ({err})" if err else "N/A"
+    try:
+        x = float(raw)
+    except (TypeError, ValueError):
+        return f"N/A ({err or 'bad value'})"
+    if not math.isfinite(x):
+        return f"N/A ({err or 'non-finite score'})"
+    return f"{x:.3f}"
+
+
+def render_ragas_metrics_block(result: dict) -> None:
+    """RAGAS via ``evaluate()`` (faithfulness, context precision, answer correctness) — see exp_ragas_financebench."""
+    if not result or result.get("error"):
+        return
+    current_ui = int(st.session_state.get("last_rag_ui", 0))
+    lr = st.session_state.get("last_rag_backend", "gemini")
+    if lr == "mock":
+        lr = "gemini"
+    if "ragas_eval_backend" not in st.session_state:
+        st.session_state.ragas_eval_backend = lr if lr in ("gemini", "openai", "ollama") else "gemini"
+
+    with st.expander(
+        "RAGAS scores (context precision · faithfulness · answer correctness)",
+        expanded=False,
+    ):
+        st.caption(
+            "Optional **post-hoc** evaluation (same stack as `experiments/exp_ragas_financebench.py`: "
+            "`ragas.evaluate` + LangChain LLM/embeddings). "
+            "**Answer accuracy** uses `answer_correctness` when a reference is set; without a reference, "
+            "context relevance uses **LLM context precision (no reference)**. "
+            "Install: `pip install ragas langchain-openai` (Gemini: also `langchain-google-genai`). "
+            "If scores show **N/A**, try another evaluator model or check API keys."
+        )
+        eb_col, em_col = st.columns(2)
+        with eb_col:
+            st.selectbox(
+                "RAGAS evaluator backend",
+                options=["gemini", "openai", "ollama"],
+                key="ragas_eval_backend",
+                help="Gemini: `GEMINI_API_KEY`. OpenAI: `OPENAI_API_KEY` (+ optional `OPENAI_BASE_URL`). "
+                "Ollama: local OpenAI-compatible API.",
+            )
+        with em_col:
+            st.text_input(
+                "RAGAS evaluator model id",
+                key="ragas_eval_model",
+                placeholder="Empty = use defaults (see caption)",
+            )
+        st.caption(
+            f"Defaults if model empty: Gemini → `{_default_ragas_eval_model('gemini')}`, "
+            f"OpenAI → `{_default_ragas_eval_model('openai')}`, "
+            f"Ollama → `{_default_ragas_eval_model('ollama')}`"
+        )
+        ref = st.text_input(
+            "Reference answer (optional, for Answer accuracy)",
+            key="ragas_reference_input",
+            placeholder="Ground truth answer; leave empty to skip Answer accuracy",
+        )
+        if st.button("Compute RAGAS scores", type="secondary", key="ragas_compute_btn"):
+            backend = str(st.session_state.get("ragas_eval_backend") or "gemini")
+            model_raw = (st.session_state.get("ragas_eval_model") or "").strip()
+            model = model_raw if model_raw else _default_ragas_eval_model(backend)
+            try:
+                scores = run_ragas_legacy_evaluate(
+                    backend=backend,
+                    model=model,
+                    user_input=str(result.get("original_question") or ""),
+                    response=str(result.get("answer") or ""),
+                    retrieved_contexts=list(result.get("final_passages") or []),
+                    reference=ref.strip() if ref else None,
+                )
+                scores["evaluator_backend"] = backend
+                scores["evaluator_model"] = model
+                st.session_state["last_ragas_scores"] = scores
+                st.session_state["ragas_scores_ui_version"] = current_ui
+            except Exception as e:
+                st.session_state["last_ragas_scores"] = {"error": str(e)}
+                st.session_state["ragas_scores_ui_version"] = current_ui
+            st.rerun()
+
+        scores = st.session_state.get("last_ragas_scores")
+        ver = st.session_state.get("ragas_scores_ui_version")
+        if (
+            scores
+            and ver is not None
+            and int(ver) == current_ui
+        ):
+            if scores.get("error"):
+                st.error(scores["error"])
+            else:
+                eb = scores.get("evaluator_backend", "—")
+                em = scores.get("evaluator_model", "—")
+                st.caption(f"Last run: evaluator **{eb}** / `{em}`")
+                lines = ["| Metric | Score |", "| --- | --- |"]
+                lines.append(
+                    "| Context relevance | "
+                    f"{_ragas_score_cell(scores.get('context_relevance'), scores.get('context_relevance_error'))} |"
+                )
+                lines.append(
+                    "| Response groundedness | "
+                    f"{_ragas_score_cell(scores.get('response_groundedness'), scores.get('response_groundedness_error'))} |"
+                )
+                aa = scores.get("answer_accuracy")
+                if aa is not None or scores.get("answer_accuracy_error"):
+                    lines.append(
+                        "| Answer accuracy | "
+                        f"{_ragas_score_cell(aa, scores.get('answer_accuracy_error'))} |"
+                    )
+                elif scores.get("answer_accuracy_note") == "skipped":
+                    lines.append("| Answer accuracy | — (no reference) |")
+                st.markdown("\n".join(lines))
+                if scores.get("context_relevance_note"):
+                    st.caption(scores["context_relevance_note"])
+                hints = []
+                for label, key in (
+                    ("Context relevance", "context_relevance_error"),
+                    ("Response groundedness", "response_groundedness_error"),
+                    ("Answer accuracy", "answer_accuracy_error"),
+                ):
+                    if scores.get(key):
+                        hints.append(f"**{label}:** {scores[key]}")
+                if hints:
+                    st.info("Details:\n\n" + "\n\n".join(hints))
+
+
+def render_latency_summary(result: dict) -> None:
+    lat = result.get("stage_latencies") or {}
+    total = result.get("latency_total_ms")
+    if not lat and total is None:
+        return
+    st.subheader("Stage latency")
+    order = [
+        ("semantic_cache_lookup_ms", "Semantic cache lookup"),
+        ("query_rewrite_ms", "Query rewrite"),
+        ("query_decomposition_ms", "Query decomposition"),
+        ("dense_retrieval_ms", "Dense retrieval"),
+        ("filter_generation_ms", "Filter generation"),
+        ("rerank_ms", "Rerank"),
+        ("prompt_build_ms", "Prompt build"),
+        ("generation_llm_ms", "Generation (LLM)"),
+        ("reflection_ms", "Reflection loops"),
+        ("citations_ms", "Citation extraction"),
+        ("semantic_cache_write_ms", "Semantic cache write"),
+    ]
+    lines = ["| Stage | ms |", "| --- | --- |"]
+    for key, label in order:
+        if key in lat:
+            lines.append(f"| {label} | {lat[key]:.2f} |")
+    if total is not None:
+        lines.append(f"| **Total (wall clock)** | **{total:.2f}** |")
+    st.markdown("\n".join(lines))
+    st.caption(
+        "Sequential per-stage timings. **Total** is end-to-end for the whole `run_pipeline` call."
+    )
 
 
 def render_stage_trace(result: dict) -> None:
@@ -1139,9 +1486,12 @@ def render_stage_trace(result: dict) -> None:
     if not stages:
         return
     st.subheader("Query process trace")
-    st.caption("Click each stage to inspect input/output.")
+    st.caption("Click each stage to inspect input/output. Titles include **latency_ms** when available.")
     for i, stg in enumerate(stages, start=1):
         title = stg.get("title") or stg.get("stage") or f"Stage {i}"
+        lm = stg.get("latency_ms")
+        if lm is not None:
+            title = f"{title} · {lm} ms"
         with st.expander(f"{i}. {title}"):
             st.write("**Input**")
             st.json(stg.get("input", {}), expanded=False)
@@ -1431,8 +1781,27 @@ def _ui_query() -> None:
     with chat_bar_options_col:
         with st.popover("Options", disabled=not ready):
             st.caption("Attached chat options")
+            vdb_backend = st.selectbox(
+                "Vector DB backend",
+                ["faiss", "milvus"],
+                disabled=not ready,
+                help="faiss = in-memory local index, milvus = remote vector database",
+            )
             retrieve_k = st.slider("FAISS top-K", 3, 30, 10, disabled=not ready)
             final_k = st.slider("Final passages to LLM", 1, 10, 3, disabled=not ready)
+            use_semantic_cache = st.checkbox(
+                "Redis semantic cache",
+                value=True,
+                disabled=not ready,
+            )
+            semantic_cache_threshold = st.slider(
+                "Semantic cache threshold",
+                0.70,
+                0.99,
+                0.93,
+                0.01,
+                disabled=not ready or not use_semantic_cache,
+            )
             use_filter_generation = st.checkbox(
                 "Filter generation (LLM include/exclude keywords)",
                 value=False,
@@ -1503,8 +1872,11 @@ def _ui_query() -> None:
 
     # Defaults when options popover is disabled (no index loaded yet)
     if not ready:
+        vdb_backend = "faiss"
         retrieve_k = 10
         final_k = 3
+        use_semantic_cache = False
+        semantic_cache_threshold = 0.93
         use_filter_generation = False
         min_filter_keep = 3
         use_rerank = True
@@ -1526,6 +1898,22 @@ def _ui_query() -> None:
         return
 
     st.divider()
+    if st.session_state.loaded_job_id:
+        sync_col, _ = st.columns([1.2, 4.8])
+        with sync_col:
+            if st.button("Sync loaded job to Milvus"):
+                try:
+                    with st.spinner("Connecting to Milvus (set MILVUS_URI; MILVUS_CONNECT_TIMEOUT)…"):
+                        embedder_sync = cached_embedder(DEFAULT_EMBED)
+                        n = _milvus_store().upsert_job_chunks(
+                            job_id=st.session_state.loaded_job_id,
+                            chunk_texts=st.session_state.corpus_chunks,
+                            embedder=embedder_sync,
+                        )
+                    st.success(f"Upserted {n} chunks to Milvus.")
+                except Exception as e:
+                    st.error(f"Milvus sync failed: {e}")
+
     result = st.session_state.get("last_rag")
     convo_col, trace_col = st.columns([1.35, 1.0])
     with convo_col:
@@ -1537,7 +1925,9 @@ def _ui_query() -> None:
             ui_id = st.session_state.get("last_rag_ui", 0)
             fk = int(st.session_state.get("last_final_k", 3))
             render_rag_trace(result, ui_id=ui_id, final_k=fk)
+            render_latency_summary(result)
             render_stage_trace(result)
+            render_ragas_metrics_block(result)
         else:
             st.info("Trace appears after the first answer.")
 
@@ -1551,6 +1941,26 @@ def _ui_query() -> None:
         except Exception as e:
             st.error(f"Generator: {e}")
             return
+        milvus_store = None
+        if vdb_backend == "milvus":
+            try:
+                with st.spinner("Connecting to Milvus…"):
+                    milvus_store = _milvus_store()
+            except Exception as e:
+                st.error(
+                    f"Milvus backend unavailable: {e}\n\n"
+                    "Start Milvus (e.g. docker) and set `MILVUS_URI` in `.env`. "
+                    "Use **faiss** backend if Milvus is not running."
+                )
+                return
+        semantic_cache = None
+        if use_semantic_cache:
+            try:
+                ns = st.session_state.loaded_job_id or "default"
+                semantic_cache = RedisSemanticCache(namespace=ns)
+            except Exception as e:
+                st.warning(f"Redis semantic cache disabled: {e}")
+                semantic_cache = None
         hist = (
             _history_to_text(st.session_state.get("query_history", []), max_turns=int(history_turns))
             if use_session_history
@@ -1580,12 +1990,18 @@ def _ui_query() -> None:
                 max_reflection_loops=int(max_reflection_loops),
                 require_citations=require_citations,
                 history=hist,
+                vdb_backend=vdb_backend,
+                milvus_store=milvus_store,
+                milvus_job_id=st.session_state.loaded_job_id,
+                semantic_cache=semantic_cache,
+                semantic_cache_threshold=float(semantic_cache_threshold),
             )
         if result.get("error"):
             st.error(result["error"])
             return
         st.session_state["last_rag"] = result
         st.session_state["last_question"] = question.strip()
+        st.session_state["last_rag_backend"] = backend
         st.session_state["last_rag_ui"] = st.session_state.get("last_rag_ui", 0) + 1
         st.session_state["last_final_k"] = final_k
         st.session_state.query_history.append(
