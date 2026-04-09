@@ -13,7 +13,12 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, List, Literal, Optional, Sequence, Tuple
 
-from src.document_extract import extract_pdf_text, extract_text_from_bytes, parse_page_list
+from src.document_extract import (
+    extract_pdf_text,
+    extract_pdf_text_full,
+    extract_text_from_bytes,
+    parse_page_list,
+)
 from src.embedder import load_embedding_model
 from src.ingest_rate_limit import RateLimiter
 from src.rag_pipeline import build_corpus_chunks_from_documents, build_retrieval_index
@@ -136,8 +141,7 @@ def run_document_ingest(
             if config.extraction == "shallow":
                 text = extract_pdf_text(raw_bytes, page_indices=pages)
             else:
-                # "full" — same text path today; multimodal OCR/tables would plug in here
-                text = extract_pdf_text(raw_bytes, page_indices=pages)
+                text = extract_pdf_text_full(raw_bytes, page_indices=pages)
         else:
             text = extract_text_from_bytes(filename, raw_bytes)
             if pages:

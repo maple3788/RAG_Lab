@@ -76,6 +76,7 @@ from src.generator import (
 )
 from src.prompts import PROMPT_TEMPLATES, format_rag_prompt
 from src.rag_generation import passages_to_context
+from src.hybrid_retrieval import BM25Resources, build_bm25_resources, fused_top_indices
 from src.reranker import Reranker, load_reranker
 from src.retriever import FaissIndex, search
 from src.storage.minio_artifacts import MinioArtifactStore, load_minio_settings
@@ -606,6 +607,10 @@ def _retrieve_rows_for_query(
     vdb_backend: str = "faiss",
     milvus_store: Optional[MilvusChunkStore] = None,
     milvus_job_id: Optional[str] = None,
+    retrieval_mode: str = "dense",
+    bm25_resources: Optional[BM25Resources] = None,
+    fusion_list_k: Optional[int] = None,
+    rrf_k: int = 60,
 ) -> List[dict]:
     if (
         vdb_backend == "milvus"
@@ -618,6 +623,32 @@ def _retrieve_rows_for_query(
             embedder=embedder,
             top_k=top_k,
         )
+    # FAISS backend: allow dense-only or hybrid BM25+dense (RRF).
+    if retrieval_mode == "hybrid" and bm25_resources is not None:
+        idx_row = fused_top_indices(
+            query,
+            embedder=embedder,
+            corpus_chunks=corpus_chunks,
+            faiss_index=faiss_index,
+            bm25_resources=bm25_resources,
+            retrieve_k=top_k,
+            rrf_k=int(rrf_k),
+            fusion_list_k=fusion_list_k,
+        )
+        rows: List[dict] = []
+        for rank, ci in enumerate(idx_row, start=1):
+            rows.append(
+                {
+                    "query_used": query,
+                    "faiss_rank": rank,
+                    "chunk_index": int(ci),
+                    # In hybrid path this is RRF-ranked, not raw FAISS score.
+                    "faiss_score": float(0.0),
+                    "text": corpus_chunks[int(ci)],
+                }
+            )
+        return rows
+
     q = prepare_query(embedder.name, query)
     q_emb = embedder.encode([q])
     faiss_scores, idx = search(faiss_index, q_emb, top_k=top_k)
@@ -671,6 +702,10 @@ def run_pipeline(
     semantic_cache: Optional[RedisSemanticCache] = None,
     semantic_cache_threshold: float = 0.93,
     semantic_cache_max_entries: int = 512,
+    retrieval_mode: str = "dense",
+    bm25_resources: Optional[BM25Resources] = None,
+    fusion_list_k: Optional[int] = None,
+    rrf_k: int = 60,
 ) -> dict:
     k = min(retrieve_k, len(corpus_chunks))
     llm_details = get_generator_details(generator)
@@ -692,6 +727,7 @@ def run_pipeline(
                 "use_reflection_loops": use_reflection_loops,
                 "require_citations": require_citations,
                 "history_chars": len(history or ""),
+                "retrieval_mode": retrieval_mode,
             },
         }
     )
@@ -796,6 +832,10 @@ def run_pipeline(
             vdb_backend=vdb_backend,
             milvus_store=milvus_store,
             milvus_job_id=milvus_job_id,
+            retrieval_mode=retrieval_mode,
+            bm25_resources=bm25_resources,
+            fusion_list_k=fusion_list_k,
+            rrf_k=rrf_k,
         )
         for row in rows:
             ci = int(row["chunk_index"])
@@ -824,9 +864,15 @@ def run_pipeline(
     stage_trace.append(
         {
             "stage": "dense_retrieval",
-            "title": "Dense retrieval + merge",
+            "title": "Retrieval + merge",
             "latency_ms": round(stage_latencies["dense_retrieval_ms"], 2),
-            "input": {"retrieval_queries": retrieval_queries, "top_k_each": k},
+            "input": {
+                "retrieval_queries": retrieval_queries,
+                "top_k_each": k,
+                "retrieval_mode": retrieval_mode,
+                "fusion_list_k": fusion_list_k,
+                "rrf_k": rrf_k,
+            },
             "output": {
                 "n_unique_chunks": len(retrieved_all),
                 "top_preview": [
@@ -1042,6 +1088,10 @@ def run_pipeline(
                 vdb_backend=vdb_backend,
                 milvus_store=milvus_store,
                 milvus_job_id=milvus_job_id,
+                retrieval_mode=retrieval_mode,
+                bm25_resources=bm25_resources,
+                fusion_list_k=fusion_list_k,
+                rrf_k=rrf_k,
             )
             added = 0
             for row in new_rows:
@@ -1217,6 +1267,7 @@ def run_pipeline(
         "truncation": truncation,
         "max_context_chars": max_context_chars,
         "use_rerank": use_rerank,
+        "retrieval_mode": retrieval_mode,
         "cache_hit": cache_hit,
     }
 
@@ -1228,6 +1279,9 @@ def render_rag_trace(result: dict, *, ui_id: int, final_k: int) -> None:
     )
 
     with tab_chunks:
+        mode = result.get("retrieval_mode", "dense")
+        if mode == "hybrid":
+            st.caption("Retrieval mode: **Hybrid BM25 + dense (RRF fusion)**.")
         if result.get("rewritten_question") and result.get("rewritten_question") != result.get("original_question"):
             st.caption(f"Query rewrite: `{result['original_question']}` → `{result['rewritten_question']}`")
         queries = result.get("retrieval_queries", [])
@@ -1787,6 +1841,30 @@ def _ui_query() -> None:
                 disabled=not ready,
                 help="faiss = in-memory local index, milvus = remote vector database",
             )
+            retrieval_mode = st.selectbox(
+                "ANN retrieval mode",
+                ["dense", "hybrid"],
+                disabled=not ready or vdb_backend != "faiss",
+                help="dense = embedding-only FAISS; hybrid = BM25 + dense merged with RRF (FAISS backend only).",
+            )
+            fusion_list_k = st.slider(
+                "Hybrid fusion list K",
+                5,
+                100,
+                30,
+                5,
+                disabled=not ready or vdb_backend != "faiss" or retrieval_mode != "hybrid",
+                help="Candidates taken from each retriever (BM25 and dense) before RRF merge.",
+            )
+            rrf_k = st.slider(
+                "RRF k",
+                10,
+                200,
+                60,
+                5,
+                disabled=not ready or vdb_backend != "faiss" or retrieval_mode != "hybrid",
+                help="RRF smoothing constant; larger values flatten rank contribution.",
+            )
             retrieve_k = st.slider("FAISS top-K", 3, 30, 10, disabled=not ready)
             final_k = st.slider("Final passages to LLM", 1, 10, 3, disabled=not ready)
             use_semantic_cache = st.checkbox(
@@ -1873,6 +1951,9 @@ def _ui_query() -> None:
     # Defaults when options popover is disabled (no index loaded yet)
     if not ready:
         vdb_backend = "faiss"
+        retrieval_mode = "dense"
+        fusion_list_k = 30
+        rrf_k = 60
         retrieve_k = 10
         final_k = 3
         use_semantic_cache = False
@@ -1966,6 +2047,10 @@ def _ui_query() -> None:
             if use_session_history
             else "None"
         )
+        bm25_resources: Optional[BM25Resources] = None
+        if vdb_backend == "faiss" and retrieval_mode == "hybrid":
+            with st.spinner("Building BM25 resources for hybrid retrieval…"):
+                bm25_resources = build_bm25_resources(st.session_state.corpus_chunks)
 
         with st.spinner("Retrieving & generating…"):
             result = run_pipeline(
@@ -1995,6 +2080,10 @@ def _ui_query() -> None:
                 milvus_job_id=st.session_state.loaded_job_id,
                 semantic_cache=semantic_cache,
                 semantic_cache_threshold=float(semantic_cache_threshold),
+                retrieval_mode=retrieval_mode,
+                bm25_resources=bm25_resources,
+                fusion_list_k=int(fusion_list_k),
+                rrf_k=int(rrf_k),
             )
         if result.get("error"):
             st.error(result["error"])
