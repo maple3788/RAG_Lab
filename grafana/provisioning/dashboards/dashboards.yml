@@ -1,0 +1,15 @@
+# Dashboard JSON lives in ./files/ (mounted at /etc/grafana/provisioning/dashboards/files).
+# In Grafana: Dashboards → Browse → folder "RAG Lab" → "RAG Lab · Prometheus"
+
+apiVersion: 1
+
+providers:
+  - name: RAG Lab
+    orgId: 1
+    folder: RAG Lab
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards/files

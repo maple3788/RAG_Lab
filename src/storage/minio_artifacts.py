@@ -135,3 +135,25 @@ class MinioArtifactStore:
                 }
             )
         return rows
+
+    def delete_job(self, job_id: str) -> int:
+        """
+        Delete all objects under ``{job_id}/`` in the ingest bucket.
+        Returns the number of objects removed (0 if prefix missing or empty).
+        """
+        jid = (job_id or "").strip()
+        if not jid or "/" in jid or ".." in jid:
+            return 0
+        prefix = f"{jid}/"
+        n = 0
+        to_delete: List[str] = []
+        for obj in self._client.list_objects(
+            self._settings.bucket, prefix=prefix, recursive=True
+        ):
+            name = getattr(obj, "object_name", None) or ""
+            if name:
+                to_delete.append(name)
+        for name in to_delete:
+            self._client.remove_object(self._settings.bucket, name)
+            n += 1
+        return n

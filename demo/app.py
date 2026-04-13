@@ -2167,6 +2167,55 @@ def _ui_library() -> None:
     )
     st.caption(f"**{len(rows)}** job(s) in bucket `{load_minio_settings().bucket}`.")
 
+    st.divider()
+    st.subheader("Remove from library")
+    st.caption(
+        "Deletes the job prefix in MinIO (chunks, FAISS index, metadata). "
+        "Optional: clears Redis ingest status. If this job is loaded in **Query**, memory is unloaded."
+    )
+    options = [r["job_id"] for r in rows]
+    label_by_id = {r["job_id"]: _job_label_for_select(r) for r in rows}
+    to_remove = st.selectbox(
+        "Job to remove",
+        options=options,
+        format_func=lambda jid: label_by_id.get(jid, jid),
+        key="library_remove_select",
+    )
+    confirm = st.checkbox(
+        "I understand this permanently deletes stored artifacts for this job",
+        key="library_remove_confirm",
+    )
+    if st.button("Remove from library", type="primary", disabled=not confirm):
+        try:
+            store = _minio_store()
+            n_obj = store.delete_job(to_remove)
+            still_there = to_remove in store.list_job_ids()
+            if n_obj == 0 and still_there:
+                st.error(
+                    "No objects were deleted but the job prefix still exists. "
+                    "Check MinIO permissions or console."
+                )
+            else:
+                try:
+                    RedisJobStore().delete_status(to_remove)
+                except Exception as redis_err:
+                    st.caption(f"Redis cleanup skipped: {redis_err}")
+                if st.session_state.get("loaded_job_id") == to_remove:
+                    unload_index()
+                if n_obj > 0:
+                    st.success(
+                        f"Removed **`{to_remove}`** from MinIO ({n_obj} object(s)). "
+                        "Milvus vectors are not deleted automatically."
+                    )
+                else:
+                    st.info(
+                        f"No MinIO objects for **`{to_remove}`** (already removed). "
+                        "Redis status cleared if present."
+                    )
+                st.rerun()
+        except Exception as e:
+            st.exception(e)
+
 
 def _job_label_for_select(row: dict[str, Any]) -> str:
     jid = row["job_id"]

@@ -11,9 +11,12 @@
 #   MINIO_USE_SSL=false
 #   REDIS_URL=redis://localhost:6379/0
 #
-# Prometheus (optional): `docker compose up -d prometheus` then open http://localhost:9090
-# Scrapes Streamlit metrics at host.docker.internal:8000 (see prometheus.yml).
-# Start the app on the host first: `streamlit run demo/app.py` (exposes /metrics on :8000).
+# Prometheus + Grafana (optional):
+#   docker compose up -d prometheus grafana
+# Prometheus: http://localhost:9090 — scrapes Streamlit at host.docker.internal:8000 (prometheus.yml).
+# Grafana:    http://localhost:3000 — admin/admin. Dashboards → Browse → folder "RAG Lab" → "RAG Lab · Prometheus".
+#            Restart Grafana after changing JSON: docker compose restart grafana
+# Start Streamlit on the host first: `streamlit run demo/app.py` (exposes /metrics on :8000).
 
 services:
   minio:
@@ -44,6 +47,20 @@ services:
       - --web.enable-lifecycle
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_DEFAULT_THEME: dark
+      GF_SERVER_ROOT_URL: http://localhost:3000
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
 
 volumes:
   minio_data:

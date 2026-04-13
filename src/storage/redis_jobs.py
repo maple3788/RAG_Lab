@@ -63,3 +63,7 @@ class RedisJobStore:
             updated_at=float(d.get("updated_at", 0)),
             meta=d.get("meta"),
         )
+
+    def delete_status(self, job_id: str) -> int:
+        """Remove ingest status key for ``job_id``. Returns number of keys deleted (0 or 1)."""
+        return int(self._r.delete(self._key(job_id.strip())))
