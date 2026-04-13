@@ -1,0 +1,33 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+
+# local data / artifacts
+data
+datasets
+results
+RAG_Lab_results_from_server
+analysis
+assets
+trec_covid_overnight.log
+
+# notebooks / editor
+.cursor
+.idea
+.vscode
+
+# runtime secrets
+.env
+
+# non-API surfaces to keep API image small
+demo
+docs
+scripts
+tools
+experiments
+grafana
+prometheus.yml

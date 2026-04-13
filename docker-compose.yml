@@ -17,6 +17,10 @@
 # Grafana:    http://localhost:3000 — admin/admin. Dashboards → Browse → folder "RAG Lab" → "RAG Lab · Prometheus".
 #            Restart Grafana after changing JSON: docker compose restart grafana
 # Start Streamlit on the host first: `streamlit run demo/app.py` (exposes /metrics on :8000).
+#
+# High-concurrency RAG API (Ollama + Milvus + Redis cache + Nginx rate-limit):
+#   docker compose up -d rag-api nginx
+# API gateway: http://localhost:8080/v1/rag/query
 
 services:
   minio:
@@ -35,6 +39,38 @@ services:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+
+  rag-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2}
+      MILVUS_URI: ${MILVUS_URI:-http://host.docker.internal:19530}
+      MILVUS_TOKEN: ${MILVUS_TOKEN:-}
+      MILVUS_COLLECTION: ${MILVUS_COLLECTION:-rag_chunks}
+      RAG_MAX_GENERATION_CONCURRENCY: ${RAG_MAX_GENERATION_CONCURRENCY:-8}
+      RAG_L1_CACHE_MAX_ITEMS: ${RAG_L1_CACHE_MAX_ITEMS:-512}
+      RAG_L1_CACHE_TTL_SEC: ${RAG_L1_CACHE_TTL_SEC:-120}
+      RAG_SEMANTIC_CACHE_MAX_ENTRIES: ${RAG_SEMANTIC_CACHE_MAX_ENTRIES:-512}
+      RAG_SEMANTIC_CACHE_TTL_SEC: ${RAG_SEMANTIC_CACHE_TTL_SEC:-86400}
+    expose:
+      - "8010"
+    depends_on:
+      - redis
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./nginx/rag-api.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - rag-api
 
   prometheus:
     image: prom/prometheus:v2.53.0
