@@ -10,7 +10,7 @@ This page describes the high-concurrency service path:
 ## Prerequisites
 
 - Ollama is running and the target model is available (default `llama3.2`).
-- Milvus is reachable from Docker (default host mapping: `host.docker.internal`).
+- Milvus is reachable from Docker (the default Compose stack includes Milvus services).
 - Redis is available (provided by Compose in this project).
 
 ## API server
@@ -26,12 +26,27 @@ Endpoints:
 
 ## Run with Docker Compose
 
+Start the Milvus stack first (included in `docker-compose.yml`):
+
+```bash
+docker compose up -d milvus-etcd milvus-minio milvus-standalone
+```
+
+Then start API and gateway:
+
 ```bash
 docker compose up -d redis rag-api nginx
 ```
 
 Gateway URL:
 - `http://localhost:8080/v1/rag/query`
+
+Quick health checks:
+
+```bash
+docker compose ps
+curl http://localhost:8080/healthz
+```
 
 ### Optional monitoring services
 

@@ -21,6 +21,10 @@
 # High-concurrency RAG API (Ollama + Milvus + Redis cache + Nginx rate-limit):
 #   docker compose up -d rag-api nginx
 # API gateway: http://localhost:8080/v1/rag/query
+#
+# Milvus stack (included below):
+#   docker compose up -d milvus-etcd milvus-minio milvus-standalone
+# Milvus gRPC: :19530, management: :9091
 
 services:
   minio:
@@ -48,7 +52,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2}
-      MILVUS_URI: ${MILVUS_URI:-http://host.docker.internal:19530}
+      MILVUS_URI: ${MILVUS_URI:-http://milvus-standalone:19530}
       MILVUS_TOKEN: ${MILVUS_TOKEN:-}
       MILVUS_COLLECTION: ${MILVUS_COLLECTION:-rag_chunks}
       RAG_MAX_GENERATION_CONCURRENCY: ${RAG_MAX_GENERATION_CONCURRENCY:-8}
@@ -60,6 +64,7 @@ services:
       - "8010"
     depends_on:
       - redis
+      - milvus-standalone
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
@@ -71,6 +76,49 @@ services:
       - ./nginx/rag-api.conf:/etc/nginx/nginx.conf:ro
     depends_on:
       - rag-api
+
+  milvus-etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    command:
+      - /usr/local/bin/etcd
+      - --advertise-client-urls=http://0.0.0.0:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --data-dir=/etcd
+    volumes:
+      - milvus_etcd_data:/etcd
+    ports:
+      - "2379:2379"
+
+  milvus-minio:
+    image: minio/minio:latest
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - milvus_minio_data:/data
+    ports:
+      - "9100:9000"
+      - "9101:9001"
+
+  milvus-standalone:
+    image: milvusdb/milvus:v2.4.13
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: host.docker.internal:2379
+      MINIO_ADDRESS: host.docker.internal:9100
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    depends_on:
+      - milvus-etcd
+      - milvus-minio
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - milvus_data:/var/lib/milvus
 
   prometheus:
     image: prom/prometheus:v2.53.0
@@ -100,3 +148,6 @@ services:
 
 volumes:
   minio_data:
+  milvus_etcd_data:
+  milvus_minio_data:
+  milvus_data:
