@@ -10,6 +10,10 @@
 #   MINIO_ENDPOINT=localhost:9000
 #   MINIO_USE_SSL=false
 #   REDIS_URL=redis://localhost:6379/0
+#
+# Prometheus (optional): `docker compose up -d prometheus` then open http://localhost:9090
+# Scrapes Streamlit metrics at host.docker.internal:8000 (see prometheus.yml).
+# Start the app on the host first: `streamlit run demo/app.py` (exposes /metrics on :8000).
 
 services:
   minio:
@@ -28,6 +32,18 @@ services:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-lifecycle
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 volumes:
   minio_data:

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Dict, List, Optional, Sequence, Tuple
+
+from prometheus_client import Histogram
 
 from src.chunker import chunk_documents, chunks_to_texts
 from src.embedder import (
@@ -14,6 +17,58 @@ from src.metrics import mean, recall_at_k
 from src.hybrid_retrieval import BM25Resources, retrieve_hybrid_pool
 from src.retriever import FaissIndex, build_faiss_index, gather_texts_by_indices, search
 from src.reranker import Reranker
+
+# Latency histograms (seconds, Prometheus convention). Used by ``retrieve_passages_pool_and_final``
+# and optionally by ``record_rag_*`` for code paths outside this module (e.g. Streamlit ``run_pipeline``).
+RAG_RETRIEVAL_SECONDS = Histogram(
+    "rag_retrieval_seconds",
+    "Wall time for retrieval in rag_pipeline (dense or hybrid + optional rerank to final pool)",
+    buckets=(
+        0.005,
+        0.01,
+        0.025,
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.5,
+        5.0,
+        10.0,
+        30.0,
+        60.0,
+    ),
+)
+RAG_GENERATION_SECONDS = Histogram(
+    "rag_generation_seconds",
+    "Wall time for LLM answer generation in the RAG stack",
+    buckets=(
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.5,
+        5.0,
+        10.0,
+        30.0,
+        60.0,
+        120.0,
+        300.0,
+    ),
+)
+
+
+def record_rag_retrieval_latency(seconds: float) -> None:
+    """Observe retrieval latency for callers that do not use ``retrieve_passages_pool_and_final``."""
+    if seconds >= 0.0:
+        RAG_RETRIEVAL_SECONDS.observe(seconds)
+
+
+def record_rag_generation_latency(seconds: float) -> None:
+    """Observe generation latency (e.g. from Streamlit or custom RAG loops)."""
+    if seconds >= 0.0:
+        RAG_GENERATION_SECONDS.observe(seconds)
 
 
 @dataclass(frozen=True)
@@ -83,33 +138,37 @@ def retrieve_passages_pool_and_final(
     ``pool``: FAISS top-``retrieve_k`` passages (before rerank), or hybrid BM25+dense+RRF if ``bm25_resources`` is set.
     ``final``: passages passed to the LLM (after rerank or slice to ``final_k``).
     """
-    k = min(retrieve_k, len(corpus_chunks))
-    if k <= 0:
-        return [], []
-    if bm25_resources is not None:
-        pool = retrieve_hybrid_pool(
-            question,
-            embedder=embedder,
-            corpus_chunks=corpus_chunks,
-            faiss_index=faiss_index,
-            bm25_resources=bm25_resources,
-            retrieve_k=k,
-            rrf_k=rrf_k,
-            fusion_list_k=fusion_list_k,
-        )
-    else:
-        q = prepare_query(embedder.name, question)
-        q_emb = embedder.encode([q])
-        _, idx = search(faiss_index, q_emb, top_k=k)
-        pool = gather_texts_by_indices(corpus_chunks, idx[0].tolist())
+    t0 = perf_counter()
+    try:
+        k = min(retrieve_k, len(corpus_chunks))
+        if k <= 0:
+            return [], []
+        if bm25_resources is not None:
+            pool = retrieve_hybrid_pool(
+                question,
+                embedder=embedder,
+                corpus_chunks=corpus_chunks,
+                faiss_index=faiss_index,
+                bm25_resources=bm25_resources,
+                retrieve_k=k,
+                rrf_k=rrf_k,
+                fusion_list_k=fusion_list_k,
+            )
+        else:
+            q = prepare_query(embedder.name, question)
+            q_emb = embedder.encode([q])
+            _, idx = search(faiss_index, q_emb, top_k=k)
+            pool = gather_texts_by_indices(corpus_chunks, idx[0].tolist())
 
-    if reranker is not None:
-        final_texts, _ = reranker.rerank(
-            question, pool, top_k=min(final_k, len(pool))
-        )
-    else:
-        final_texts = pool[: min(final_k, len(pool))]
-    return pool, final_texts
+        if reranker is not None:
+            final_texts, _ = reranker.rerank(
+                question, pool, top_k=min(final_k, len(pool))
+            )
+        else:
+            final_texts = pool[: min(final_k, len(pool))]
+        return pool, final_texts
+    finally:
+        RAG_RETRIEVAL_SECONDS.observe(perf_counter() - t0)
 
 
 def retrieve_passages_for_query(

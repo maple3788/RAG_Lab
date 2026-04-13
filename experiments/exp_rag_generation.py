@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 from pathlib import Path
 import sys
-from typing import cast
+from typing import Any, Dict, Optional, cast
 
 import pandas as pd
 
@@ -25,6 +26,35 @@ from src.rag_pipeline import build_retrieval_corpus, build_retrieval_index
 from src.reranker import load_reranker
 
 
+def _metrics_for_table(m: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in m.items() if k not in ("per_example", "approx_total_tokens")}
+
+
+def _log_run(
+    experiment: str,
+    setting: str,
+    cfg: RAGGenerationConfig,
+    m: Dict[str, Any],
+    log_meta: Dict[str, str],
+) -> None:
+    from src.experiment_tracking import log_evaluation_batch
+
+    flat = _metrics_for_table(m)
+    pe = m.get("per_example") or []
+    config = {**asdict(cfg), "embedding_model": log_meta["embedding_model"]}
+    log_evaluation_batch(
+        source="exp_rag_generation.py",
+        experiment_name=experiment,
+        setting_label=setting,
+        embedding_model=log_meta["embedding_model"],
+        llm_backend=log_meta["llm_backend"],
+        llm_model=log_meta["llm_model"],
+        config=config,
+        metrics=flat,
+        per_example=pe,
+    )
+
+
 def _make_generator(args: argparse.Namespace):
     if args.mock_generation:
         return MockGenerator()
@@ -35,7 +65,16 @@ def _make_generator(args: argparse.Namespace):
     return GeminiGenerator(model=args.llm_model)
 
 
-def run_compare_rerank(embedder, corpus_chunks, examples, generator, base: RAGGenerationConfig, reranker, faiss_index):
+def run_compare_rerank(
+    embedder,
+    corpus_chunks,
+    examples,
+    generator,
+    base: RAGGenerationConfig,
+    reranker,
+    faiss_index,
+    log_meta: Optional[Dict[str, str]] = None,
+):
     rows = []
     for use_rerank, label in [(False, "no_rerank"), (True, "with_rerank")]:
         cfg = RAGGenerationConfig(
@@ -64,13 +103,24 @@ def run_compare_rerank(embedder, corpus_chunks, examples, generator, base: RAGGe
             config=cfg,
             reranker=reranker if use_rerank else None,
             faiss_index=faiss_index,
+            return_per_example=True,
         )
-        rows.append({"experiment": "rerank", "setting": label, **m})
-        print(label, m)
+        rows.append({"experiment": "rerank", "setting": label, **_metrics_for_table(m)})
+        if log_meta:
+            _log_run("rerank", label, cfg, m, log_meta)
+        print(label, _metrics_for_table(m))
     return rows
 
 
-def run_compare_topk(embedder, corpus_chunks, examples, generator, base: RAGGenerationConfig, faiss_index):
+def run_compare_topk(
+    embedder,
+    corpus_chunks,
+    examples,
+    generator,
+    base: RAGGenerationConfig,
+    faiss_index,
+    log_meta: Optional[Dict[str, str]] = None,
+):
     rows = []
     for fk in [1, 3, 5]:
         cfg = RAGGenerationConfig(
@@ -99,13 +149,24 @@ def run_compare_topk(embedder, corpus_chunks, examples, generator, base: RAGGene
             config=cfg,
             reranker=None,
             faiss_index=faiss_index,
+            return_per_example=True,
         )
-        rows.append({"experiment": "topk", "setting": f"final_k={fk}", **m})
-        print(f"final_k={fk}", m)
+        rows.append({"experiment": "topk", "setting": f"final_k={fk}", **_metrics_for_table(m)})
+        if log_meta:
+            _log_run("topk", f"final_k={fk}", cfg, m, log_meta)
+        print(f"final_k={fk}", _metrics_for_table(m))
     return rows
 
 
-def run_compare_prompts(embedder, corpus_chunks, examples, generator, base: RAGGenerationConfig, faiss_index):
+def run_compare_prompts(
+    embedder,
+    corpus_chunks,
+    examples,
+    generator,
+    base: RAGGenerationConfig,
+    faiss_index,
+    log_meta: Optional[Dict[str, str]] = None,
+):
     rows = []
     for name, tmpl in PROMPT_TEMPLATES.items():
         cfg = RAGGenerationConfig(
@@ -134,9 +195,12 @@ def run_compare_prompts(embedder, corpus_chunks, examples, generator, base: RAGG
             config=cfg,
             reranker=None,
             faiss_index=faiss_index,
+            return_per_example=True,
         )
-        rows.append({"experiment": "prompt", "setting": name, **m})
-        print(name, m)
+        rows.append({"experiment": "prompt", "setting": name, **_metrics_for_table(m)})
+        if log_meta:
+            _log_run("prompt", name, cfg, m, log_meta)
+        print(name, _metrics_for_table(m))
     return rows
 
 
@@ -149,6 +213,7 @@ def run_compare_truncation(
     *,
     max_context_chars: int,
     faiss_index,
+    log_meta: Optional[Dict[str, str]] = None,
 ):
     rows = []
     for strat in ("head", "tail", "middle"):
@@ -178,9 +243,12 @@ def run_compare_truncation(
             config=cfg,
             reranker=None,
             faiss_index=faiss_index,
+            return_per_example=True,
         )
-        rows.append({"experiment": "truncation", "setting": strat, **m})
-        print(strat, m)
+        rows.append({"experiment": "truncation", "setting": strat, **_metrics_for_table(m)})
+        if log_meta:
+            _log_run("truncation", strat, cfg, m, log_meta)
+        print(strat, _metrics_for_table(m))
     return rows
 
 
@@ -224,6 +292,11 @@ def main() -> None:
         "--mock-generation",
         action="store_true",
         help="Use MockGenerator (no API; for pipeline smoke tests only)",
+    )
+    parser.add_argument(
+        "--no-experiment-db",
+        action="store_true",
+        help="Skip writing per-run rows to results/experiment_db.sqlite",
     )
     args = parser.parse_args()
     if args.llm_model is None:
@@ -275,15 +348,29 @@ def main() -> None:
         print("Building FAISS index (reused across all runs in this process)…")
         faiss_index = build_retrieval_index(embedder, corpus_chunks)
 
+    log_meta: Optional[Dict[str, str]] = None
+    if not args.no_experiment_db:
+        log_meta = {
+            "embedding_model": args.embedding_model,
+            "llm_backend": args.llm_backend,
+            "llm_model": args.llm_model,
+        }
+
     all_rows = []
     if args.mode in ("compare-rerank", "all"):
         all_rows.extend(
-            run_compare_rerank(embedder, corpus_chunks, examples, generator, base, reranker, faiss_index)
+            run_compare_rerank(
+                embedder, corpus_chunks, examples, generator, base, reranker, faiss_index, log_meta
+            )
         )
     if args.mode in ("compare-topk", "all"):
-        all_rows.extend(run_compare_topk(embedder, corpus_chunks, examples, generator, base, faiss_index))
+        all_rows.extend(
+            run_compare_topk(embedder, corpus_chunks, examples, generator, base, faiss_index, log_meta)
+        )
     if args.mode in ("compare-prompts", "all"):
-        all_rows.extend(run_compare_prompts(embedder, corpus_chunks, examples, generator, base, faiss_index))
+        all_rows.extend(
+            run_compare_prompts(embedder, corpus_chunks, examples, generator, base, faiss_index, log_meta)
+        )
     if args.mode in ("compare-truncation", "all"):
         all_rows.extend(
             run_compare_truncation(
@@ -294,6 +381,7 @@ def main() -> None:
                 base,
                 max_context_chars=args.truncation_chars,
                 faiss_index=faiss_index,
+                log_meta=log_meta,
             )
         )
 

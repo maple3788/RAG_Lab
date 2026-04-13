@@ -1,5 +1,5 @@
 """
-Streamlit: sidebar nav (**Ingest** | **Query** | **Library**), MinIO-backed ingest, job browser.
+Streamlit: **Ingest** | **Query** | **Library** | **Benchmark** (SQLite experiment DB, Plotly, Redis).
 
 Run::
 
@@ -8,6 +8,7 @@ Run::
 
 from __future__ import annotations
 
+from dataclasses import asdict
 import logging
 import html
 import math
@@ -45,7 +46,11 @@ for _noisy in (
 
 import sys
 
+import json
+
 import numpy as np
+import pandas as pd
+import plotly.express as px
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -85,6 +90,22 @@ from src.storage.redis_jobs import RedisJobStore
 from src.storage.redis_semantic_cache import RedisSemanticCache
 from src.streaming_parser import HiddenReasoningStreamParser, strip_hidden_reasoning_text
 from src.ragas_ui_metrics import run_ragas_legacy_evaluate
+from src.rag_pipeline import record_rag_generation_latency, record_rag_retrieval_latency
+from src.experiment_tracking import (
+    FAILURE_FEEDBACK_LABELS,
+    aggregate_token_totals,
+    fetch_queries_dataframe,
+    fetch_runs_dataframe,
+    init_db,
+    log_experiment_run,
+    log_query_event,
+    update_query_feedback,
+)
+from src.metrics import (
+    approx_token_count,
+    composite_ragas_score,
+    compute_answer_metrics,
+)
 
 
 DEFAULT_EMBED = "BAAI/bge-base-en-v1.5"
@@ -556,45 +577,49 @@ def generate_visible_answer(
     on_visible_text: Optional[Callable[[str], None]] = None,
     on_raw_text: Optional[Callable[[str], None]] = None,
 ) -> str:
-    parser = HiddenReasoningStreamParser()
-    out_parts: List[str] = []
-    raw_parts: List[str] = []
+    t_gen = perf_counter()
+    try:
+        parser = HiddenReasoningStreamParser()
+        out_parts: List[str] = []
+        raw_parts: List[str] = []
 
-    if on_visible_text is not None and isinstance(
-        generator, (StreamingTextGenerator, StreamingChatTextGenerator)
-    ):
-        if isinstance(generator, StreamingChatTextGenerator):
-            token_iter = generator.generate_chat_stream(
-                system_prompt=system_prompt, user_prompt=user_prompt
-            )
-        else:
-            token_iter = generator.generate_stream(prompt)
-        for token in token_iter:
-            raw_parts.append(token)
-            if on_raw_text is not None:
-                on_raw_text("".join(raw_parts))
-            visible = parser.feed(token)
-            if visible:
-                out_parts.append(visible)
+        if on_visible_text is not None and isinstance(
+            generator, (StreamingTextGenerator, StreamingChatTextGenerator)
+        ):
+            if isinstance(generator, StreamingChatTextGenerator):
+                token_iter = generator.generate_chat_stream(
+                    system_prompt=system_prompt, user_prompt=user_prompt
+                )
+            else:
+                token_iter = generator.generate_stream(prompt)
+            for token in token_iter:
+                raw_parts.append(token)
+                if on_raw_text is not None:
+                    on_raw_text("".join(raw_parts))
+                visible = parser.feed(token)
+                if visible:
+                    out_parts.append(visible)
+                    on_visible_text("".join(out_parts))
+            tail = parser.flush()
+            if tail:
+                out_parts.append(tail)
                 on_visible_text("".join(out_parts))
-        tail = parser.flush()
-        if tail:
-            out_parts.append(tail)
-            on_visible_text("".join(out_parts))
-        return "".join(out_parts).strip()
+            return "".join(out_parts).strip()
 
-    raw = llm_generate_text(
-        generator=generator,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        combined_prompt=prompt,
-    )
-    if on_raw_text is not None:
-        on_raw_text(raw)
-    visible = strip_hidden_reasoning_text(raw)
-    if on_visible_text is not None:
-        on_visible_text(visible)
-    return visible
+        raw = llm_generate_text(
+            generator=generator,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            combined_prompt=prompt,
+        )
+        if on_raw_text is not None:
+            on_raw_text(raw)
+        visible = strip_hidden_reasoning_text(raw)
+        if on_visible_text is not None:
+            on_visible_text(visible)
+        return visible
+    finally:
+        record_rag_generation_latency(perf_counter() - t_gen)
 
 
 def _retrieve_rows_for_query(
@@ -954,6 +979,13 @@ def run_pipeline(
                 "final_passage_preview": final_passages[: min(3, len(final_passages))],
             },
         }
+    )
+    record_rag_retrieval_latency(
+        (
+            float(stage_latencies.get("dense_retrieval_ms", 0.0))
+            + float(stage_latencies.get("rerank_ms", 0.0))
+        )
+        / 1000.0
     )
 
     def _compose_rag_prompt_parts(
@@ -1553,6 +1585,357 @@ def render_stage_trace(result: dict) -> None:
             st.json(stg.get("output", {}), expanded=False)
 
 
+# --- Benchmarking & observability (``results/experiment_db.sqlite``) ---
+GEMINI_25_FLASH_USD_PER_1M = (0.30, 2.50)
+GLM45_CLASS_USD_PER_1M = (0.60, 2.20)
+
+
+def _safe_json_loads(val: Any) -> dict[str, Any]:
+    if val is None:
+        return {}
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, float) and not math.isfinite(val):
+        return {}
+    try:
+        return json.loads(str(val))
+    except Exception:
+        return {}
+
+
+def _runs_leaderboard_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    parsed: List[dict[str, Any]] = []
+    for _, row in df.iterrows():
+        parsed.append(_safe_json_loads(row.get("metrics_json")))
+    mdf = pd.DataFrame(parsed)
+    drop_cols = [c for c in ("metrics_json", "config_json") if c in df.columns]
+    out = df.drop(columns=drop_cols, errors="ignore").copy()
+    if not mdf.empty:
+        for c in mdf.columns:
+            out[c] = mdf[c].values
+    return out
+
+
+def _log_ui_rag_observation(
+    *,
+    question: str,
+    answer: str,
+    result: dict,
+    model_config: dict[str, Any],
+    reference: str,
+    backend: str,
+    job_id: Optional[str],
+    llm_model: Optional[str] = None,
+) -> None:
+    init_db()
+    prompt = str(result.get("prompt") or "")
+    tok = approx_token_count(prompt, answer)
+    lat = float(result.get("latency_total_ms") or 0.0)
+    ref = (reference or "").strip()
+    metrics_computed: dict[str, Any] = {
+        "latency_total_ms": lat,
+        "n_questions": 1.0,
+    }
+    gh: Optional[float] = None
+    f1v: Optional[float] = None
+    em: Optional[float] = None
+    if ref:
+        am = compute_answer_metrics(answer, ref)
+        f1v = float(am["token_f1"])
+        gh = float(am["gold_hit"])
+        em = float(am["exact_match"])
+        metrics_computed["token_f1"] = f1v
+        metrics_computed["gold_hit"] = gh
+        metrics_computed["exact_match"] = em
+
+    ragas = st.session_state.get("last_ragas_scores")
+    ui_ver = st.session_state.get("ragas_scores_ui_version")
+    cur_ui = int(st.session_state.get("last_rag_ui", 0))
+    if (
+        isinstance(ragas, dict)
+        and not ragas.get("error")
+        and ui_ver is not None
+        and int(ui_ver) == cur_ui
+    ):
+        for k in ("context_relevance", "response_groundedness", "answer_accuracy"):
+            if ragas.get(k) is not None:
+                try:
+                    metrics_computed[k] = float(ragas[k])
+                except (TypeError, ValueError):
+                    pass
+        comp = composite_ragas_score(ragas)
+        if comp is not None:
+            metrics_computed["ragas_composite"] = float(comp)
+
+    run_id = log_experiment_run(
+        source="demo/app.py",
+        run_label=f"ui_query:{(job_id or 'local')[:24]}",
+        experiment_tag="ui_query",
+        embedding_model=str(model_config.get("embedding_model") or DEFAULT_EMBED),
+        model_config=model_config,
+        latency_ms=lat,
+        token_count=tok,
+        metrics=metrics_computed,
+        llm_backend=backend,
+        llm_model=llm_model,
+        job_id=job_id,
+    )
+    log_query_event(
+        source="demo/app.py",
+        question=question,
+        llm_output=answer,
+        retrieved_chunks=list(result.get("final_passages") or []),
+        latency_ms=lat,
+        token_count=tok,
+        model_config=model_config,
+        reference_answer=ref or None,
+        gold_hit=gh,
+        token_f1=f1v,
+        exact_match=em,
+        ragas=ragas if isinstance(ragas, dict) else None,
+        run_id=run_id,
+        stage_trace=result.get("stage_trace"),
+    )
+
+
+def _ui_benchmark() -> None:
+    st.title("RAG experiment observability")
+    st.caption(
+        "Leaderboard and traces are backed by **results/experiment_db.sqlite** "
+        "(populated by **Benchmark** UI logging, **Query** logging, and **experiments/exp_rag_generation.py**)."
+    )
+    init_db()
+    df_runs = fetch_runs_dataframe()
+    totals = aggregate_token_totals()
+    nq = len(fetch_queries_dataframe())
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("Logged aggregate runs", f"{len(df_runs):,}")
+    with m2:
+        st.metric("Logged query events", f"{nq:,}")
+    with m3:
+        st.metric("Tokens (runs table)", f"{int(totals['run_table_tokens']):,}")
+    with m4:
+        st.metric("Tokens (query table)", f"{int(totals['query_table_tokens']):,}")
+
+    tab_lb, tab_fail, tab_cost, tab_jobs = st.tabs(
+        [
+            "Performance Leaderboard",
+            "Failure analysis",
+            "Cost calculator",
+            "Job metadata (Redis)",
+        ]
+    )
+
+    with tab_lb:
+        st.subheader("Performance Leaderboard")
+        st.caption(
+            "Compare configurations from scripted sweeps and UI runs. "
+            "Mean **latency_ms** on the X-axis is wall-clock for the logged unit (batch mean or single query)."
+        )
+        flat = _runs_leaderboard_frame(df_runs)
+        if flat.empty:
+            st.info("No runs yet. Run **exp_rag_generation.py** or enable logging on the **Query** page.")
+        else:
+            show_cols = [
+                c
+                for c in (
+                    "id",
+                    "created_at",
+                    "source",
+                    "run_label",
+                    "embedding_model",
+                    "chunk_size",
+                    "retrieve_k",
+                    "final_k",
+                    "use_hybrid",
+                    "use_rerank",
+                    "latency_ms",
+                    "token_count",
+                    "token_f1",
+                    "gold_hit",
+                    "exact_match",
+                    "latency_total_ms",
+                    "n_questions",
+                    "ragas_composite",
+                    "semantic_cache_hit_rate",
+                )
+                if c in flat.columns
+            ]
+            st.dataframe(flat[show_cols], use_container_width=True, hide_index=True)
+
+            plot_rows: List[dict[str, Any]] = []
+            for _, row in df_runs.iterrows():
+                m = _safe_json_loads(row.get("metrics_json"))
+                y_r = m.get("ragas_composite")
+                y_f = m.get("token_f1")
+                y_plot = y_r if y_r is not None else y_f
+                if y_plot is None:
+                    continue
+                try:
+                    yf = float(y_plot)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(yf):
+                    continue
+                lx = row.get("latency_ms")
+                if lx is None:
+                    continue
+                try:
+                    xf = float(lx)
+                except (TypeError, ValueError):
+                    continue
+                cfg = _safe_json_loads(row.get("config_json"))
+                label = str(row.get("run_label") or row.get("source") or "")
+                rr = int(row.get("use_rerank") or 0)
+                plot_rows.append(
+                    {
+                        "latency_ms": xf,
+                        "accuracy_y": yf,
+                        "score_kind": "RAGAS composite" if y_r is not None else "Token F1",
+                        "label": label[:80],
+                        "rerank": "rerank on" if rr else "rerank off",
+                    }
+                )
+            if plot_rows:
+                pdf = pd.DataFrame(plot_rows)
+                fig = px.scatter(
+                    pdf,
+                    x="latency_ms",
+                    y="accuracy_y",
+                    color="rerank",
+                    hover_data=["label", "score_kind"],
+                    labels={
+                        "latency_ms": "Latency (ms)",
+                        "accuracy_y": "Accuracy (RAGAS composite or token F1)",
+                    },
+                    title="Accuracy vs speed trade-off",
+                )
+                fig.update_layout(height=520)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Need runs with both **latency_ms** and **token_f1** or **ragas_composite** to plot.")
+
+    with tab_fail:
+        st.subheader("Bad-case review")
+        st.caption(
+            "Rows where **gold hit** missed (gold_hit below 0.5) or **token F1** is below 0.2. "
+            "Provide a reference answer on the **Query** page to populate these fields for UI runs."
+        )
+        df_fail = fetch_queries_dataframe(failed_only=True)
+        if not df_fail.empty:
+            mask = (df_fail["gold_hit"].fillna(1.0) < 0.5) | (
+                df_fail["token_f1"].fillna(1.0) < 0.2
+            )
+            df_fail = df_fail[mask]
+        if df_fail.empty:
+            st.info("No failed queries logged yet (or no reference / metrics captured).")
+        else:
+            ids = [int(x) for x in df_fail["id"].tolist()]
+            pick = st.selectbox("Select query id", ids, format_func=lambda i: f"#{i}")
+            row = df_fail[df_fail["id"] == pick].iloc[0]
+            q1, q2, q3 = st.columns(3)
+            with q1:
+                st.markdown("**User query**")
+                st.text_area("q", str(row.get("question") or ""), height=220, key="bad_q", label_visibility="collapsed")
+            with q2:
+                st.markdown("**Retrieved chunks (final context)**")
+                chunks = _safe_json_loads(row.get("retrieved_chunks_json"))
+                if isinstance(chunks, list):
+                    blob = "\n\n---\n\n".join(str(c) for c in chunks)
+                else:
+                    blob = str(chunks)
+                st.text_area("ctx", blob, height=220, key="bad_ctx", label_visibility="collapsed")
+            with q3:
+                st.markdown("**LLM output**")
+                st.text_area("out", str(row.get("llm_output") or ""), height=220, key="bad_out", label_visibility="collapsed")
+            st.caption(
+                f"gold_hit={row.get('gold_hit')} · token_f1={row.get('token_f1')} · "
+                f"latency_ms={row.get('latency_ms')} · tokens={row.get('token_count')}"
+            )
+            with st.expander("Full trace (stage_trace_json)"):
+                st.json(_safe_json_loads(row.get("stage_trace_json")), expanded=False)
+
+            fb_col, _ = st.columns([1, 2])
+            with fb_col:
+                tag = st.selectbox(
+                    "Human feedback",
+                    options=["(none)"] + list(FAILURE_FEEDBACK_LABELS),
+                    key="fail_fb_pick",
+                )
+                if st.button("Save feedback tag", key="fail_fb_save"):
+                    if tag == "(none)":
+                        st.warning("Pick a label first.")
+                    else:
+                        update_query_feedback(int(pick), tag)
+                        st.success("Saved.")
+                        st.rerun()
+
+    with tab_cost:
+        st.subheader("Cost calculator (RMB estimates)")
+        st.caption(
+            "Rates default to **Gemini 2.5 Flash** (~$0.30 / $2.50 per 1M tok) and **GLM-4.5-class** (~$0.60 / $2.20 per 1M tok on Z.AI). "
+            "Adjust FX and split to match your billing."
+        )
+        fx = st.number_input("USD → CNY", min_value=0.01, value=7.20, step=0.05, format="%.2f")
+        in_frac = st.slider("Assumed share of tokens that are prompt (input)", 0.0, 1.0, 0.72, 0.01)
+        out_frac = max(0.0, 1.0 - in_frac)
+        gem_in = GEMINI_25_FLASH_USD_PER_1M[0] * fx
+        gem_out = GEMINI_25_FLASH_USD_PER_1M[1] * fx
+        glm_in = GLM45_CLASS_USD_PER_1M[0] * fx
+        glm_out = GLM45_CLASS_USD_PER_1M[1] * fx
+
+        def _cost_million_scale(total_tokens: float, rin: float, rout: float) -> float:
+            t = max(0.0, float(total_tokens))
+            return (t * in_frac / 1e6) * rin + (t * out_frac / 1e6) * rout
+
+        tr = totals["run_table_tokens"] + totals["query_table_tokens"]
+        g_cost = _cost_million_scale(tr, gem_in, gem_out)
+        z_cost = _cost_million_scale(tr, glm_in, glm_out)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric("Est. Gemini 2.5 Flash (RMB)", f"¥{g_cost:.4f}")
+        with c2:
+            st.metric("Est. GLM-4.5-class (RMB)", f"¥{z_cost:.4f}")
+        st.caption(
+            f"Combined token basis: **{int(tr):,}** (runs + query tables; heuristic tokens from char/4 estimates)."
+        )
+
+    with tab_jobs:
+        st.subheader("Ingest job metadata (Redis + MinIO)")
+        st.caption(
+            "Redis: live pipeline status (``ingest:job:{{id}}``). "
+            "MinIO: persisted artifact index (same as **Library**)."
+        )
+        jid = st.text_input("Job ID", value=st.session_state.get("last_job_id", ""), key="bench_redis_jid")
+        if st.button("Fetch Redis status", key="bench_redis_btn"):
+            if not (jid or "").strip():
+                st.warning("Enter a job id.")
+            else:
+                try:
+                    job_st = RedisJobStore().get_status(jid.strip())
+                    if job_st is None:
+                        st.warning("No key found for this job id.")
+                    else:
+                        st.json(asdict(job_st))
+                except Exception as e:
+                    st.error(str(e))
+        st.divider()
+        st.markdown("**MinIO ingest jobs (metadata table)**")
+        try:
+            mrows = _minio_store().list_ingest_jobs_table()
+            st.dataframe(
+                mrows[:200] if len(mrows) > 200 else mrows,
+                use_container_width=True,
+                hide_index=True,
+            )
+        except Exception as e:
+            st.warning(f"MinIO: {e}")
+
+
 def unload_index() -> None:
     st.session_state.corpus_chunks = []
     st.session_state.faiss_index = None
@@ -1632,24 +2015,50 @@ def _sidebar_nav() -> str:
             use_container_width=True,
             type="primary" if nav == "library" else "secondary",
         )
+        b4 = st.button(
+            "Benchmark",
+            key="nav_benchmark",
+            use_container_width=True,
+            type="primary" if nav == "benchmark" else "secondary",
+        )
         if b1:
             st.session_state.nav = "ingest"
         if b2:
             st.session_state.nav = "query"
         if b3:
             st.session_state.nav = "library"
+        if b4:
+            st.session_state.nav = "benchmark"
         st.divider()
-        st.caption("MinIO + Redis")
+        st.caption("MinIO + Redis · SQLite experiments")
     return st.session_state.nav
 
 
 def main() -> None:
     st.set_page_config(page_title="RAG Lab", layout="wide", initial_sidebar_state="expanded")
     _init_session()
+    if not st.session_state.get("_prometheus_http_started"):
+        try:
+            from prometheus_client import start_http_server
+
+            _prom_port = int(os.environ.get("PROMETHEUS_METRICS_PORT", "8000"))
+            start_http_server(_prom_port)
+            st.session_state._prometheus_http_started = True
+            logging.getLogger(__name__).info(
+                "Prometheus metrics: http://0.0.0.0:%s/metrics", _prom_port
+            )
+        except OSError as e:
+            st.session_state._prometheus_http_started = True
+            logging.getLogger(__name__).warning(
+                "Prometheus metrics server not started (port may be in use): %s", e
+            )
     _sidebar_nav()
 
-    st.title("Document pipeline")
     nav = st.session_state.nav
+    if nav == "benchmark":
+        _ui_benchmark()
+        return
+    st.title("Document pipeline")
     if nav == "ingest":
         _ui_ingest_pipeline()
     elif nav == "query":
@@ -1979,6 +2388,17 @@ def _ui_query() -> None:
         return
 
     st.divider()
+    with st.expander("Experiment logging (SQLite benchmark DB)", expanded=False):
+        st.caption(
+            "Appends to **results/experiment_db.sqlite** for the **Benchmark** leaderboard, cost view, and bad-case review."
+        )
+        st.checkbox("Log each query to the experiment DB", value=True, key="exp_log_queries")
+        st.text_area(
+            "Reference answer (optional — enables token F1, gold hit, and failure filters)",
+            key="exp_reference_answer",
+            height=72,
+        )
+
     if st.session_state.loaded_job_id:
         sync_col, _ = st.columns([1.2, 4.8])
         with sync_col:
@@ -2108,6 +2528,40 @@ def _ui_query() -> None:
                 "a": result.get("answer", ""),
             }
         )
+        if st.session_state.get("exp_log_queries", True):
+            try:
+                ref = (st.session_state.get("exp_reference_answer") or "").strip()
+                mc: dict[str, Any] = {
+                    "embedding_model": DEFAULT_EMBED,
+                    "retrieve_k": int(retrieve_k),
+                    "final_k": int(final_k),
+                    "use_rerank": bool(use_rerank),
+                    "use_hybrid": retrieval_mode == "hybrid",
+                    "fusion_list_k": int(fusion_list_k),
+                    "rrf_k": int(rrf_k),
+                    "retrieval_mode": retrieval_mode,
+                    "vdb_backend": vdb_backend,
+                    "max_context_chars": int(max_context_chars),
+                    "truncation": str(truncation),
+                    "template_key": template_key,
+                    "use_query_rewrite": use_query_rewrite,
+                    "use_query_decomposition": use_query_decomposition,
+                    "use_filter_generation": use_filter_generation,
+                    "use_reflection_loops": use_reflection_loops,
+                }
+                lm = getattr(gen, "model", None)
+                _log_ui_rag_observation(
+                    question=question.strip(),
+                    answer=str(result.get("answer") or ""),
+                    result=result,
+                    model_config=mc,
+                    reference=ref,
+                    backend=backend,
+                    job_id=st.session_state.get("loaded_job_id"),
+                    llm_model=str(lm) if lm is not None else None,
+                )
+            except Exception as e:
+                logging.getLogger(__name__).warning("experiment log failed: %s", e)
         st.rerun()
 
 

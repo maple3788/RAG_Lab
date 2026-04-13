@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -87,7 +87,8 @@ def evaluate_rag_answer_quality(
     config: RAGGenerationConfig,
     reranker: Optional[Reranker] = None,
     faiss_index: Optional[FaissIndex] = None,
-) -> Dict[str, float]:
+    return_per_example: bool = False,
+) -> Dict[str, Any]:
     """
     End-to-end: retrieve → build prompt → generate → EM / F1 / gold hit (mean over examples).
     Pass ``faiss_index`` to reuse the same index across runs (large corpora).
@@ -105,6 +106,7 @@ def evaluate_rag_answer_quality(
     cache_hits = 0.0
     cache_lookups = 0.0
     semantic_cache: List[Tuple[np.ndarray, str]] = []
+    per_example_rows: List[Dict[str, Any]] = []
 
     def _gold_strings(ex: QAExample) -> List[str]:
         if ex.answer_aliases:
@@ -144,6 +146,20 @@ def evaluate_rag_answer_quality(
                 lat_generate_ms.append(0.0)
                 lat_rewrite_ms.append(0.0)
                 lat_total_ms.append((perf_counter() - t0_total) * 1000.0)
+                if return_per_example:
+                    per_example_rows.append(
+                        {
+                            "question": ex.question,
+                            "reference_answer": ex.answer,
+                            "prediction": "",
+                            "retrieved_passages": [],
+                            "token_f1": 0.0,
+                            "gold_hit": 0.0,
+                            "exact_match": 0.0,
+                            "latency_total_ms": lat_total_ms[-1],
+                            "token_count": 1,
+                        }
+                    )
                 continue
             fi = build_retrieval_index(embedder, chunks)
             bm25 = (
@@ -244,8 +260,23 @@ def evaluate_rag_answer_quality(
         f1s.append(max(token_f1(prediction, g) for g in golds))
         hits.append(max(gold_answer_hit(prediction, g) for g in golds))
         lat_total_ms.append((perf_counter() - t0_total) * 1000.0)
+        if return_per_example:
+            tok = max(1, (len(prompt) + len(prediction)) // 4)
+            per_example_rows.append(
+                {
+                    "question": ex.question,
+                    "reference_answer": ex.answer,
+                    "prediction": prediction,
+                    "retrieved_passages": list(passages),
+                    "token_f1": f1s[-1],
+                    "gold_hit": hits[-1],
+                    "exact_match": ems[-1],
+                    "latency_total_ms": lat_total_ms[-1],
+                    "token_count": tok,
+                }
+            )
 
-    return {
+    out: Dict[str, Any] = {
         "exact_match": mean(ems),
         "token_f1": mean(f1s),
         "gold_hit": mean(hits),
@@ -256,3 +287,9 @@ def evaluate_rag_answer_quality(
         "semantic_cache_hit_rate": (cache_hits / cache_lookups) if cache_lookups > 0 else 0.0,
         "n_questions": float(len(examples)),
     }
+    if return_per_example:
+        out["per_example"] = per_example_rows
+        out["approx_total_tokens"] = float(
+            sum(int(x.get("token_count") or 0) for x in per_example_rows)
+        )
+    return out

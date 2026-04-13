@@ -9,3 +9,6 @@ data/
 *.log
 RAG_Lab_results_from_server/
 analysis/*.jsonl
+
+# Local experiment run database (created by Streamlit / scripts)
+results/experiment_db.sqlite
