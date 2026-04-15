@@ -101,8 +101,11 @@ class MilvusChunkStore:
             }
         return out
 
-    def _ensure_collection(self, dim: int, *, metric_type: str) -> None:
-        name = self.settings.collection
+    def _collection_name(self, collection_name: Optional[str] = None) -> str:
+        return (collection_name or self.settings.collection).strip()
+
+    def _ensure_collection(self, dim: int, *, metric_type: str, collection_name: Optional[str] = None) -> None:
+        name = self._collection_name(collection_name)
         if self._client.has_collection(collection_name=name):
             return
         # pymilvus accepts id_type "int" | "string" (not the literal "int64"); "int" → INT64.
@@ -118,9 +121,19 @@ class MilvusChunkStore:
             enable_dynamic_field=True,
         )
 
-    def _ensure_index(self, cfg: MilvusIndexConfig) -> None:
-        name = self.settings.collection
+    def _ensure_index(self, cfg: MilvusIndexConfig, *, collection_name: Optional[str] = None) -> None:
+        name = self._collection_name(collection_name)
         params = self._index_params_for(cfg)
+        # Milvus allows one distinct index per vector field. If an index already
+        # exists on this collection, re-creation would fail and only add noisy logs.
+        try:
+            existing = self._client.list_indexes(collection_name=name)
+            if existing:
+                return
+        except Exception:
+            # If index listing is unavailable on this client version, continue and
+            # rely on create_index compatibility handling below.
+            pass
         # Compatibility across pymilvus versions.
         try:
             if hasattr(self._client, "prepare_index_params"):
@@ -144,6 +157,70 @@ class MilvusChunkStore:
             # Some configurations auto-index; keep ingest robust.
             return
 
+    def describe_collection(self, *, collection_name: Optional[str] = None) -> dict[str, Any]:
+        """
+        Return live collection/index metadata for debugging UI.
+        """
+        name = self._collection_name(collection_name)
+        out: dict[str, Any] = {"collection": name}
+        try:
+            if not self._client.has_collection(collection_name=name):
+                out["exists"] = False
+                return out
+            out["exists"] = True
+            try:
+                out["stats"] = self._client.get_collection_stats(collection_name=name)
+            except Exception:
+                pass
+            try:
+                out["index"] = self._client.describe_index(
+                    collection_name=name,
+                    index_name="",
+                )
+            except Exception:
+                pass
+            try:
+                out["indexes"] = self._client.list_indexes(collection_name=name)
+            except Exception:
+                pass
+            return out
+        except Exception as e:
+            out["error"] = str(e)
+            return out
+
+    def list_collections(self) -> List[str]:
+        try:
+            return list(self._client.list_collections())
+        except Exception:
+            return []
+
+    def load_collection(self, *, collection_name: Optional[str] = None, release_others: bool = False) -> dict[str, Any]:
+        """
+        Load one collection for search. Optionally release all other loaded collections.
+        """
+        target = self._collection_name(collection_name)
+        out: dict[str, Any] = {"target": target, "released": []}
+        if not self._client.has_collection(collection_name=target):
+            out["exists"] = False
+            return out
+        out["exists"] = True
+        if release_others:
+            for cname in self.list_collections():
+                if cname == target:
+                    continue
+                try:
+                    self._client.release_collection(collection_name=cname)
+                    out["released"].append(cname)
+                except Exception:
+                    pass
+        try:
+            self._client.load_collection(collection_name=target)
+            out["loaded"] = True
+        except Exception as e:
+            out["loaded"] = False
+            out["error"] = str(e)
+        return out
+
     @staticmethod
     def _stable_id(job_id: str, chunk_index: int) -> int:
         # Stable per (job, chunk), fits signed int64.
@@ -158,6 +235,7 @@ class MilvusChunkStore:
         embedder: EmbeddingModel,
         batch_size: int = 256,
         index_config: Optional[MilvusIndexConfig] = None,
+        collection_name: Optional[str] = None,
     ) -> int:
         if not chunk_texts:
             return 0
@@ -165,8 +243,9 @@ class MilvusChunkStore:
         vecs = embedder.encode(passages)
         dim = int(vecs.shape[1])
         idx_cfg = index_config or MilvusIndexConfig()
-        self._ensure_collection(dim, metric_type=idx_cfg.metric_type)
-        self._ensure_index(idx_cfg)
+        target = self._collection_name(collection_name)
+        self._ensure_collection(dim, metric_type=idx_cfg.metric_type, collection_name=target)
+        self._ensure_index(idx_cfg, collection_name=target)
 
         rows = []
         for i, text in enumerate(chunk_texts):
@@ -179,7 +258,7 @@ class MilvusChunkStore:
                     "vector": vecs[i].tolist(),
                 }
             )
-        name = self.settings.collection
+        name = target
         for start in range(0, len(rows), max(1, int(batch_size))):
             self._client.upsert(
                 collection_name=name,
@@ -197,15 +276,17 @@ class MilvusChunkStore:
         top_k: int,
         search_config: Optional[MilvusSearchConfig] = None,
         index_type: str = "AUTOINDEX",
+        collection_name: Optional[str] = None,
     ) -> List[dict]:
         if top_k <= 0:
             return []
         s_cfg = search_config or MilvusSearchConfig()
         idx_type = (index_type or "AUTOINDEX").upper()
+        target = self._collection_name(collection_name)
         q = prepare_query(embedder.name, query)
         q_vec = embedder.encode([q])[0].tolist()
         # Collection is created on first upsert; search before any sync had no collection.
-        self._ensure_collection(len(q_vec), metric_type=s_cfg.metric_type)
+        self._ensure_collection(len(q_vec), metric_type=s_cfg.metric_type, collection_name=target)
         search_params: dict[str, Any] = {
             "metric_type": (s_cfg.metric_type or "COSINE").upper(),
             "params": {},
@@ -215,7 +296,7 @@ class MilvusChunkStore:
         elif idx_type == "HNSW":
             search_params["params"] = {"ef": int(s_cfg.hnsw_ef)}
         out = self._client.search(
-            collection_name=self.settings.collection,
+            collection_name=target,
             data=[q_vec],
             filter=f'job_id == "{job_id}"',
             limit=int(top_k),

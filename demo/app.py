@@ -675,6 +675,7 @@ def _retrieve_rows_for_query(
     vdb_backend: str = "faiss",
     milvus_store: Optional[MilvusChunkStore] = None,
     milvus_job_id: Optional[str] = None,
+    milvus_collection: Optional[str] = None,
     milvus_index_type: str = "AUTOINDEX",
     milvus_search_config: Optional[MilvusSearchConfig] = None,
     retrieval_mode: str = "dense",
@@ -694,6 +695,7 @@ def _retrieve_rows_for_query(
             top_k=top_k,
             search_config=milvus_search_config,
             index_type=milvus_index_type,
+            collection_name=milvus_collection,
         )
     # FAISS backend: allow dense-only or hybrid BM25+dense (RRF).
     if retrieval_mode == "hybrid" and bm25_resources is not None:
@@ -771,6 +773,7 @@ def run_pipeline(
     vdb_backend: str = "faiss",
     milvus_store: Optional[MilvusChunkStore] = None,
     milvus_job_id: Optional[str] = None,
+    milvus_collection: Optional[str] = None,
     milvus_index_type: str = "AUTOINDEX",
     milvus_search_config: Optional[MilvusSearchConfig] = None,
     semantic_cache: Optional[RedisSemanticCache] = None,
@@ -803,6 +806,7 @@ def run_pipeline(
                 "history_chars": len(history or ""),
                 "retrieval_mode": retrieval_mode,
                 "milvus_index_type": milvus_index_type,
+                "milvus_collection": milvus_collection,
             },
         }
     )
@@ -907,6 +911,7 @@ def run_pipeline(
             vdb_backend=vdb_backend,
             milvus_store=milvus_store,
             milvus_job_id=milvus_job_id,
+            milvus_collection=milvus_collection,
             milvus_index_type=milvus_index_type,
             milvus_search_config=milvus_search_config,
             retrieval_mode=retrieval_mode,
@@ -1172,6 +1177,7 @@ def run_pipeline(
                 vdb_backend=vdb_backend,
                 milvus_store=milvus_store,
                 milvus_job_id=milvus_job_id,
+                milvus_collection=milvus_collection,
                 milvus_index_type=milvus_index_type,
                 milvus_search_config=milvus_search_config,
                 retrieval_mode=retrieval_mode,
@@ -1994,6 +2000,7 @@ def unload_index() -> None:
     st.session_state.source_label = None
     st.session_state.ingest_meta = {}
     st.session_state.loaded_job_id = None
+    st.session_state.loaded_milvus_collection = None
     st.session_state.pop("last_rag", None)
     st.session_state.pop("last_question", None)
     st.session_state.query_history = []
@@ -2008,11 +2015,19 @@ def load_job(job_id: str) -> None:
     fn = meta.get("filename") or "document"
     st.session_state.source_label = f"{job_id.strip()} · {fn}"
     st.session_state.loaded_job_id = job_id.strip()
+    st.session_state.loaded_milvus_collection = str(meta.get("milvus_collection") or "").strip() or None
     st.session_state.last_job_id = job_id.strip()
     st.session_state.pop("last_rag", None)
     st.session_state.pop("last_question", None)
     st.session_state.query_history = []
     st.session_state.qa_messages = []
+    if st.session_state.loaded_milvus_collection:
+        load_res = _milvus_store().load_collection(
+            collection_name=st.session_state.loaded_milvus_collection,
+            release_others=True,
+        )
+        if not load_res.get("loaded"):
+            raise RuntimeError(f"Milvus collection load failed: {load_res}")
 
 
 def _init_session() -> None:
@@ -2028,6 +2043,8 @@ def _init_session() -> None:
         st.session_state.last_job_id = ""
     if "loaded_job_id" not in st.session_state:
         st.session_state.loaded_job_id = None
+    if "loaded_milvus_collection" not in st.session_state:
+        st.session_state.loaded_milvus_collection = None
     if "nav" not in st.session_state:
         st.session_state.nav = "ingest"
     if "query_history" not in st.session_state:
@@ -2125,31 +2142,59 @@ def _ui_ingest_pipeline() -> None:
     st.subheader("1 — Upload & page filter")
     up_col, filt_col = st.columns(2)
     with up_col:
-        uploaded = st.file_uploader("Document", type=["pdf", "txt", "md"], key="ing_upl")
+        uploaded_files = st.file_uploader(
+            "Documents",
+            type=["pdf", "txt", "md"],
+            key="ing_upl",
+            accept_multiple_files=True,
+            help="Upload one or more documents; each file becomes a separate ingest job.",
+        )
     with filt_col:
         page_spec = st.text_input(
             "Page filter (PDF)",
             "",
             placeholder="1,3,5-8 — empty = all",
+            help="Optional PDF page selection. Empty means all pages. Ignored for non-PDF files.",
         )
 
     st.subheader("2 — Extraction")
-    extraction = st.radio("Depth", ("shallow", "full"), horizontal=True)
+    extraction = st.radio(
+        "Depth",
+        ("shallow", "full"),
+        horizontal=True,
+        help="shallow is faster extraction; full is more thorough but slower.",
+    )
 
     st.subheader("3 — Chunking & summarization")
     c1, c2, c3 = st.columns(3)
     with c1:
-        chunk_size = st.number_input("Chunk size", 128, 2048, 512, 64)
-        chunk_overlap = st.number_input("Chunk overlap", 0, 512, 64, 32)
+        chunk_size = st.number_input(
+            "Chunk size",
+            128,
+            2048,
+            512,
+            64,
+            help="Approximate characters/tokens per chunk. Larger chunks carry more context but reduce granularity.",
+        )
+        chunk_overlap = st.number_input(
+            "Chunk overlap",
+            0,
+            512,
+            64,
+            32,
+            help="Shared text between adjacent chunks to reduce boundary information loss.",
+        )
     with c2:
         strat = st.selectbox(
             "Summarization strategy",
             ("single", "hierarchical", "iterative"),
+            help="single: no summaries; hierarchical: per-chunk summaries; iterative: per-chunk + global abstract.",
         )
     with c3:
         summ_backend = st.selectbox(
             "Summarizer LLM (if not single)",
             ["mock", "gemini", "openai", "ollama"],
+            help="LLM backend used for summary generation when strategy is not single.",
         )
     with st.expander("Milvus index options", expanded=False):
         ingest_preset = st.selectbox(
@@ -2165,11 +2210,13 @@ def _ui_ingest_pipeline() -> None:
                 "Index type",
                 MILVUS_INDEX_TYPES,
                 index=MILVUS_INDEX_TYPES.index(str(pvals["index_type"])),
+                help="AUTOINDEX lets Milvus choose; IVF_FLAT uses cluster lists; HNSW uses graph search.",
             )
             milvus_metric_type = st.selectbox(
                 "Metric",
                 MILVUS_METRICS,
                 index=MILVUS_METRICS.index(str(pvals["metric_type"])),
+                help="Similarity metric for vector scoring: COSINE, IP (dot product), or L2 (Euclidean distance).",
             )
             milvus_upsert_batch_size = st.slider(
                 "Upsert batch size",
@@ -2177,6 +2224,7 @@ def _ui_ingest_pipeline() -> None:
                 1024,
                 int(pvals["upsert_batch_size"]),
                 32,
+                help="Number of rows inserted per upsert batch. Larger batches are faster but use more memory.",
             )
         with mi2:
             milvus_ivf_nlist = st.slider(
@@ -2186,6 +2234,7 @@ def _ui_ingest_pipeline() -> None:
                 int(pvals["ivf_nlist"]),
                 64,
                 disabled=milvus_index_type != "IVF_FLAT",
+                help="IVF cluster count. Larger values can improve recall but increase build and memory cost.",
             )
         with mi3:
             milvus_hnsw_m = st.slider(
@@ -2195,6 +2244,7 @@ def _ui_ingest_pipeline() -> None:
                 int(pvals["hnsw_m"]),
                 2,
                 disabled=milvus_index_type != "HNSW",
+                help="HNSW connectivity. Higher M often improves quality with higher memory/build cost.",
             )
             milvus_hnsw_ef_construction = st.slider(
                 "HNSW efConstruction",
@@ -2203,12 +2253,13 @@ def _ui_ingest_pipeline() -> None:
                 int(pvals["hnsw_ef_construction"]),
                 8,
                 disabled=milvus_index_type != "HNSW",
+                help="HNSW build-time search depth. Higher values usually improve recall but slow indexing.",
             )
 
     st.subheader("4 — Run → MinIO + Redis")
     if st.button("Run full pipeline", type="primary"):
-        if uploaded is None:
-            st.error("Upload a document first.")
+        if not uploaded_files:
+            st.error("Upload at least one document first.")
         else:
             try:
                 cfg = IngestPipelineConfig(
@@ -2224,17 +2275,53 @@ def _ui_ingest_pipeline() -> None:
                     milvus_upsert_batch_size=int(milvus_upsert_batch_size),
                 )
                 summ = ingest_summarizer(summ_backend) if strat != "single" else None
-                with st.spinner("Running pipeline…"):
-                    meta = run_document_ingest(
-                        filename=uploaded.name,
-                        raw_bytes=uploaded.getvalue(),
-                        page_filter_spec=page_spec,
-                        config=cfg,
-                        summarizer=summ,
+                successes: List[dict[str, Any]] = []
+                failures: List[dict[str, str]] = []
+                total = len(uploaded_files)
+                progress_bar = st.progress(0.0, text=f"Starting ingest for {total} file(s)…")
+                status_box = st.empty()
+                for i, up in enumerate(uploaded_files, start=1):
+                    status_box.info(f"Running pipeline ({i}/{total}): {up.name}")
+                    try:
+                        meta = run_document_ingest(
+                            filename=up.name,
+                            raw_bytes=up.getvalue(),
+                            page_filter_spec=page_spec,
+                            config=cfg,
+                            summarizer=summ,
+                        )
+                        successes.append(meta)
+                        st.session_state["last_job_id"] = meta["job_id"]
+                    except Exception as e:
+                        failures.append({"filename": up.name, "error": str(e)})
+                    progress_bar.progress(
+                        i / max(1, total),
+                        text=f"Completed {i}/{total} file(s)",
                     )
-                st.success(f"**job_id:** `{meta['job_id']}`")
-                st.json(meta)
-                st.session_state["last_job_id"] = meta["job_id"]
+
+                if failures:
+                    status_box.warning(
+                        f"Finished with errors: {len(successes)} succeeded, {len(failures)} failed."
+                    )
+                else:
+                    status_box.success(f"Finished ingest for {len(successes)} file(s).")
+
+                if successes:
+                    st.success(f"Ingested {len(successes)} file(s) successfully.")
+                    st.json(
+                        [
+                            {
+                                "job_id": m.get("job_id"),
+                                "filename": m.get("filename"),
+                                "n_chunks": m.get("n_chunks"),
+                                "milvus_collection": m.get("milvus_collection"),
+                            }
+                            for m in successes
+                        ]
+                    )
+                if failures:
+                    st.error(f"{len(failures)} file(s) failed.")
+                    st.json(failures)
             except Exception as e:
                 st.exception(e)
 
@@ -2274,6 +2361,9 @@ def _ui_library() -> None:
             "embedding_model": st.column_config.TextColumn("embedding"),
             "summarization": st.column_config.TextColumn("summary strat"),
             "extraction": st.column_config.TextColumn("extraction"),
+            "milvus_collection": st.column_config.TextColumn("milvus collection", width="large"),
+            "milvus_index_type": st.column_config.TextColumn("index"),
+            "milvus_metric_type": st.column_config.TextColumn("metric"),
         },
     )
     st.caption(f"**{len(rows)}** job(s) in bucket `{load_minio_settings().bucket}`.")
@@ -2351,6 +2441,8 @@ def _ui_query() -> None:
             f"Loaded **{st.session_state.loaded_job_id}** — "
             f"{len(st.session_state.corpus_chunks)} chunks · {st.session_state.source_label}"
         )
+        if st.session_state.get("loaded_milvus_collection"):
+            st.caption(f"Milvus collection loaded: `{st.session_state.loaded_milvus_collection}`")
     else:
         st.warning("No job loaded.")
 
@@ -2377,6 +2469,7 @@ def _ui_query() -> None:
             options=options,
             index=default_ix,
             format_func=lambda jid: label_by_id.get(jid, jid),
+            help="Choose which ingest job to load for querying.",
         )
 
     if st.button("Load", type="primary"):
@@ -2426,6 +2519,7 @@ def _ui_query() -> None:
                 if default_milvus_index_type in MILVUS_INDEX_TYPES
                 else 0,
                 disabled=not ready,
+                help="Expected index family for this loaded collection; controls which query-time knobs are applied.",
             )
             milvus_metric_type = st.selectbox(
                 "Milvus metric",
@@ -2434,6 +2528,7 @@ def _ui_query() -> None:
                 if default_milvus_metric_type in MILVUS_METRICS
                 else 0,
                 disabled=not ready,
+                help="Distance metric used at query time. Should match the collection/index metric used at ingest.",
             )
             milvus_ivf_nprobe = st.slider(
                 "Milvus IVF nprobe",
@@ -2442,6 +2537,7 @@ def _ui_query() -> None:
                 int(qvals["ivf_nprobe"]),
                 1,
                 disabled=not ready or milvus_index_type != "IVF_FLAT",
+                help="IVF query breadth (number of clusters searched). Higher improves recall but adds latency.",
             )
             milvus_hnsw_ef = st.slider(
                 "Milvus HNSW ef",
@@ -2450,7 +2546,18 @@ def _ui_query() -> None:
                 int(qvals["hnsw_ef"]),
                 8,
                 disabled=not ready or milvus_index_type not in ("HNSW", "AUTOINDEX"),
+                help="HNSW query breadth. Higher ef improves recall at the cost of slower search.",
             )
+            dbg_col, _ = st.columns([1.8, 4.2])
+            with dbg_col:
+                if st.button("Show active Milvus index config", disabled=not ready):
+                    try:
+                        info = _milvus_store().describe_collection(
+                            collection_name=st.session_state.get("loaded_milvus_collection")
+                        )
+                        st.json(info)
+                    except Exception as e:
+                        st.error(f"Failed to read Milvus index config: {e}")
             fusion_list_k = st.slider(
                 "Hybrid fusion list K",
                 5,
@@ -2469,12 +2576,27 @@ def _ui_query() -> None:
                 disabled=True,
                 help="RRF smoothing constant; larger values flatten rank contribution.",
             )
-            retrieve_k = st.slider("Retrieval top-K", 3, 30, 10, disabled=not ready)
-            final_k = st.slider("Final passages to LLM", 1, 10, 3, disabled=not ready)
+            retrieve_k = st.slider(
+                "Retrieval top-K",
+                3,
+                30,
+                10,
+                disabled=not ready,
+                help="How many chunks to retrieve before rerank/filter stages.",
+            )
+            final_k = st.slider(
+                "Final passages to LLM",
+                1,
+                10,
+                3,
+                disabled=not ready,
+                help="How many passages are included in the final LLM prompt context.",
+            )
             use_semantic_cache = st.checkbox(
                 "Redis semantic cache",
                 value=True,
                 disabled=not ready,
+                help="Reuse previous answers for semantically similar questions to reduce latency and cost.",
             )
             semantic_cache_threshold = st.slider(
                 "Semantic cache threshold",
@@ -2483,11 +2605,13 @@ def _ui_query() -> None:
                 0.93,
                 0.01,
                 disabled=not ready or not use_semantic_cache,
+                help="Minimum cosine similarity to treat a cached answer as a hit.",
             )
             use_filter_generation = st.checkbox(
                 "Filter generation (LLM include/exclude keywords)",
                 value=False,
                 disabled=not ready,
+                help="Ask an LLM to generate include/exclude keyword filters before final context selection.",
             )
             min_filter_keep = st.slider(
                 "Min chunks to keep after filter",
@@ -2495,21 +2619,39 @@ def _ui_query() -> None:
                 10,
                 3,
                 disabled=not ready or not use_filter_generation,
+                help="Guarantees at least this many chunks survive filtering.",
             )
-            use_rerank = st.checkbox("Cross-encoder rerank", value=True, disabled=not ready)
-            use_query_rewrite = st.checkbox("Query rewrite", value=False, disabled=not ready)
-            use_query_decomposition = st.checkbox("Query decomposition", value=False, disabled=not ready)
+            use_rerank = st.checkbox(
+                "Cross-encoder rerank",
+                value=True,
+                disabled=not ready,
+                help="Re-score retrieved chunks with a cross-encoder for better ordering.",
+            )
+            use_query_rewrite = st.checkbox(
+                "Query rewrite",
+                value=False,
+                disabled=not ready,
+                help="Rewrite the user query for better retrieval quality.",
+            )
+            use_query_decomposition = st.checkbox(
+                "Query decomposition",
+                value=False,
+                disabled=not ready,
+                help="Split complex questions into multiple focused retrieval sub-queries.",
+            )
             max_subqueries = st.slider(
                 "Max sub-queries",
                 2,
                 6,
                 3,
                 disabled=not ready or not use_query_decomposition,
+                help="Maximum number of generated sub-queries.",
             )
             use_reflection_loops = st.checkbox(
                 "Reflection loops (answer critique + follow-up retrieval)",
                 value=False,
                 disabled=not ready,
+                help="Iteratively critique answers and run additional retrieval if needed.",
             )
             max_reflection_loops = st.slider(
                 "Max reflection loops",
@@ -2517,16 +2659,19 @@ def _ui_query() -> None:
                 4,
                 2,
                 disabled=not ready or not use_reflection_loops,
+                help="Upper bound on reflection iterations.",
             )
             require_citations = st.checkbox(
                 "Require citation markers in answer ([1], [2])",
                 value=True,
                 disabled=not ready,
+                help="Encourage answers to include citation markers tied to retrieved passages.",
             )
             use_session_history = st.checkbox(
                 "Use session history in rewrite/decomposition",
                 value=True,
                 disabled=not ready,
+                help="Include recent chat turns when rewriting/decomposing the query.",
             )
             history_turns = st.slider(
                 "History turns",
@@ -2534,22 +2679,34 @@ def _ui_query() -> None:
                 8,
                 3,
                 disabled=not ready or not use_session_history,
+                help="How many recent turns to include as history context.",
             )
             template_key = st.selectbox(
                 "Prompt template",
                 list(PROMPT_TEMPLATES.keys()),
                 disabled=not ready,
+                help="Prompt formatting strategy used for final answer generation.",
             )
             max_context_chars = st.number_input(
-                "Max context chars", 500, 32000, 6000, step=500, disabled=not ready
+                "Max context chars",
+                500,
+                32000,
+                6000,
+                step=500,
+                disabled=not ready,
+                help="Maximum total context length sent to the LLM after retrieval/rerank.",
             )
             truncation = st.selectbox(
-                "Truncation", ["head", "tail", "middle"], disabled=not ready
+                "Truncation",
+                ["head", "tail", "middle"],
+                disabled=not ready,
+                help="How to trim context if it exceeds max context chars.",
             )
             backend = st.selectbox(
                 "LLM",
                 ["mock", "gemini", "openai", "ollama"],
                 disabled=not ready,
+                help="Answer-generation backend used for final response.",
             )
 
     # Defaults when options popover is disabled (no index loaded yet)
@@ -2684,6 +2841,7 @@ def _ui_query() -> None:
                 vdb_backend=vdb_backend,
                 milvus_store=milvus_store,
                 milvus_job_id=st.session_state.loaded_job_id,
+                milvus_collection=st.session_state.get("loaded_milvus_collection"),
                 milvus_index_type=str(milvus_index_type),
                 milvus_search_config=milvus_search_config,
                 semantic_cache=semantic_cache,

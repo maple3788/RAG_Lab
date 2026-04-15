@@ -132,6 +132,9 @@ class MinioArtifactStore:
                     "embedding_model": meta.get("embedding_model", "—"),
                     "summarization": meta.get("summarization", "—"),
                     "extraction": meta.get("extraction", "—"),
+                    "milvus_collection": meta.get("milvus_collection", "—"),
+                    "milvus_index_type": meta.get("milvus_index_type", "—"),
+                    "milvus_metric_type": meta.get("milvus_metric_type", "—"),
                 }
             )
         return rows

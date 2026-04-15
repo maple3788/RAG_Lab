@@ -7,6 +7,8 @@ summarization strategy → embed + Milvus upsert → **store artifacts in MinIO*
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, List, Literal, Optional, Sequence, Tuple
@@ -61,6 +63,23 @@ def _chunks_to_records(
 def _stub_summaries(texts: Sequence[str]) -> List[str]:
     """Deterministic placeholder when no LLM summarizer is provided."""
     return [(t[:240] + "…") if len(t) > 240 else t for t in texts]
+
+
+def _collection_name_for_config(config: IngestPipelineConfig) -> str:
+    """
+    Stable collection routing: same config/model -> same Milvus collection.
+    Different config -> different collection.
+    """
+    payload = {
+        "embedding_model": config.embedding_model,
+        "index_type": config.milvus_index_type,
+        "metric_type": config.milvus_metric_type,
+        "ivf_nlist": int(config.milvus_ivf_nlist),
+        "hnsw_m": int(config.milvus_hnsw_m),
+        "hnsw_ef_construction": int(config.milvus_hnsw_ef_construction),
+    }
+    sig = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:10]
+    return f"rag_chunks_{sig}"
 
 
 def _run_summarization(
@@ -173,6 +192,7 @@ def run_document_ingest(
         _status("embedding", "embedding + upsert to Milvus")
         embedder = load_embedding_model(config.embedding_model, normalize=True)
         milvus = milvus_store or MilvusChunkStore()
+        target_collection = _collection_name_for_config(config)
         index_cfg = MilvusIndexConfig(
             index_type=config.milvus_index_type,
             metric_type=config.milvus_metric_type,
@@ -186,6 +206,7 @@ def run_document_ingest(
             embedder=embedder,
             batch_size=int(config.milvus_upsert_batch_size),
             index_config=index_cfg,
+            collection_name=target_collection,
         )
 
         _status("storing", "uploading to MinIO")
@@ -206,7 +227,7 @@ def run_document_ingest(
             "n_chunks": len(chunks),
             "extraction": config.extraction,
             "summarization": config.summarization,
-            "milvus_collection": milvus.settings.collection,
+            "milvus_collection": target_collection,
             "milvus_rows_upserted": int(n_upserted),
             "milvus_index_type": index_cfg.index_type,
             "milvus_metric_type": index_cfg.metric_type,
