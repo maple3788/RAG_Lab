@@ -2,9 +2,7 @@
 Multi-stage ingest aligned with the product flowchart:
 
 upload → (optional page filter) → extraction (shallow vs full text) → chunking +
-summarization strategy → embed + FAISS → **store artifacts in MinIO** → **Redis status**.
-
-Vector **search** still uses FAISS in memory after loading index bytes from MinIO.
+summarization strategy → embed + Milvus upsert → **store artifacts in MinIO** → **Redis status**.
 """
 
 from __future__ import annotations
@@ -21,9 +19,9 @@ from src.document_extract import (
 )
 from src.embedder import load_embedding_model
 from src.ingest_rate_limit import RateLimiter
-from src.rag_pipeline import build_corpus_chunks_from_documents, build_retrieval_index
-from src.retriever import FaissIndex, deserialize_faiss_index, serialize_faiss_index
+from src.rag_pipeline import build_corpus_chunks_from_documents
 from src.storage.minio_artifacts import MinioArtifactStore, load_minio_settings
+from src.storage.milvus_store import MilvusChunkStore, MilvusIndexConfig
 from src.storage.redis_jobs import JobStatus, RedisJobStore
 
 SummarizationStrategy = Literal["single", "hierarchical", "iterative"]
@@ -39,6 +37,12 @@ class IngestPipelineConfig:
     summarization: SummarizationStrategy = "single"
     #: Min seconds between LLM calls when summarization needs the model
     llm_min_interval_seconds: float = 0.75
+    milvus_index_type: str = "AUTOINDEX"
+    milvus_metric_type: str = "COSINE"
+    milvus_ivf_nlist: int = 1024
+    milvus_hnsw_m: int = 16
+    milvus_hnsw_ef_construction: int = 200
+    milvus_upsert_batch_size: int = 256
 
 
 def _chunks_to_records(
@@ -108,6 +112,7 @@ def run_document_ingest(
     config: IngestPipelineConfig,
     summarizer: Optional[Callable[[str], str]] = None,
     minio: Optional[MinioArtifactStore] = None,
+    milvus_store: Optional[MilvusChunkStore] = None,
     redis_store: Optional[RedisJobStore] = None,
     job_id: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -165,10 +170,23 @@ def run_document_ingest(
             summarizer=summarizer,
         )
 
-        _status("embedding", "building FAISS index")
+        _status("embedding", "embedding + upsert to Milvus")
         embedder = load_embedding_model(config.embedding_model, normalize=True)
-        faiss_index: FaissIndex = build_retrieval_index(embedder, chunks)
-        index_bytes = serialize_faiss_index(faiss_index)
+        milvus = milvus_store or MilvusChunkStore()
+        index_cfg = MilvusIndexConfig(
+            index_type=config.milvus_index_type,
+            metric_type=config.milvus_metric_type,
+            ivf_nlist=int(config.milvus_ivf_nlist),
+            hnsw_m=int(config.milvus_hnsw_m),
+            hnsw_ef_construction=int(config.milvus_hnsw_ef_construction),
+        )
+        n_upserted = milvus.upsert_job_chunks(
+            job_id=jid,
+            chunk_texts=chunks,
+            embedder=embedder,
+            batch_size=int(config.milvus_upsert_batch_size),
+            index_config=index_cfg,
+        )
 
         _status("storing", "uploading to MinIO")
         prefix = f"{jid}/"
@@ -179,7 +197,6 @@ def run_document_ingest(
         )
         records = _chunks_to_records(chunks, summaries if summaries else None)
         store.put_json(prefix + "chunks.json", {"chunks": records})
-        store.put_bytes(prefix + "faiss.index", index_bytes, content_type="application/octet-stream")
         meta = {
             "job_id": jid,
             "filename": filename,
@@ -189,7 +206,13 @@ def run_document_ingest(
             "n_chunks": len(chunks),
             "extraction": config.extraction,
             "summarization": config.summarization,
-            "index_dim": faiss_index.dim,
+            "milvus_collection": milvus.settings.collection,
+            "milvus_rows_upserted": int(n_upserted),
+            "milvus_index_type": index_cfg.index_type,
+            "milvus_metric_type": index_cfg.metric_type,
+            "milvus_ivf_nlist": int(index_cfg.ivf_nlist),
+            "milvus_hnsw_m": int(index_cfg.hnsw_m),
+            "milvus_hnsw_ef_construction": int(index_cfg.hnsw_ef_construction),
             "minio_bucket": store.bucket_name,
             "prefix": prefix,
         }
@@ -209,17 +232,15 @@ def load_ingest_from_minio(
     job_id: str,
     *,
     minio: Optional[MinioArtifactStore] = None,
-) -> tuple[list[str], FaissIndex, dict[str, Any]]:
+) -> tuple[list[str], dict[str, Any]]:
     """
-    Download chunks + FAISS index from MinIO for in-memory retrieval.
+    Download chunks + metadata from MinIO.
 
-    Returns ``(chunk_texts, faiss_index, metadata)``.
+    Returns ``(chunk_texts, metadata)``.
     """
     store = minio or MinioArtifactStore(load_minio_settings())
     prefix = f"{job_id}/"
     meta = store.get_json(prefix + "metadata.json")
     chunks_payload = store.get_json(prefix + "chunks.json")
     texts = [c["text"] for c in chunks_payload["chunks"]]
-    index_bytes = store.get_bytes(prefix + "faiss.index")
-    faiss_index = deserialize_faiss_index(index_bytes)
-    return texts, faiss_index, meta
+    return texts, meta

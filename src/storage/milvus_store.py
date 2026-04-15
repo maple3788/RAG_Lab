@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from dotenv import load_dotenv
 
@@ -33,6 +33,30 @@ class MilvusSettings:
         )
 
 
+@dataclass(frozen=True)
+class MilvusIndexConfig:
+    """
+    Milvus ANN index knobs used when creating vector index on ``vector`` field.
+    """
+
+    index_type: str = "AUTOINDEX"
+    metric_type: str = "COSINE"
+    ivf_nlist: int = 1024
+    hnsw_m: int = 16
+    hnsw_ef_construction: int = 200
+
+
+@dataclass(frozen=True)
+class MilvusSearchConfig:
+    """
+    Per-query ANN search knobs.
+    """
+
+    metric_type: str = "COSINE"
+    ivf_nprobe: int = 32
+    hnsw_ef: int = 64
+
+
 class MilvusChunkStore:
     """
     Thin wrapper over Milvus for chunk vectors.
@@ -61,7 +85,23 @@ class MilvusChunkStore:
             kwargs["token"] = self.settings.token
         self._client = MilvusClient(**kwargs)
 
-    def _ensure_collection(self, dim: int) -> None:
+    def _index_params_for(self, cfg: MilvusIndexConfig) -> dict[str, Any]:
+        idx = (cfg.index_type or "AUTOINDEX").upper()
+        out: dict[str, Any] = {
+            "index_type": idx,
+            "metric_type": (cfg.metric_type or "COSINE").upper(),
+            "params": {},
+        }
+        if idx == "IVF_FLAT":
+            out["params"] = {"nlist": int(cfg.ivf_nlist)}
+        elif idx == "HNSW":
+            out["params"] = {
+                "M": int(cfg.hnsw_m),
+                "efConstruction": int(cfg.hnsw_ef_construction),
+            }
+        return out
+
+    def _ensure_collection(self, dim: int, *, metric_type: str) -> None:
         name = self.settings.collection
         if self._client.has_collection(collection_name=name):
             return
@@ -72,11 +112,37 @@ class MilvusChunkStore:
             primary_field_name="id",
             id_type="int",
             vector_field_name="vector",
-            metric_type="COSINE",
+            metric_type=(metric_type or "COSINE").upper(),
             auto_id=False,
             consistency_level="Strong",
             enable_dynamic_field=True,
         )
+
+    def _ensure_index(self, cfg: MilvusIndexConfig) -> None:
+        name = self.settings.collection
+        params = self._index_params_for(cfg)
+        # Compatibility across pymilvus versions.
+        try:
+            if hasattr(self._client, "prepare_index_params"):
+                ip = self._client.prepare_index_params()
+                ip.add_index(
+                    field_name="vector",
+                    index_type=params["index_type"],
+                    metric_type=params["metric_type"],
+                    params=params.get("params", {}),
+                )
+                self._client.create_index(collection_name=name, index_params=ip)
+            else:
+                self._client.create_index(
+                    collection_name=name,
+                    field_name="vector",
+                    index_type=params["index_type"],
+                    metric_type=params["metric_type"],
+                    params=params.get("params", {}),
+                )
+        except Exception:
+            # Some configurations auto-index; keep ingest robust.
+            return
 
     @staticmethod
     def _stable_id(job_id: str, chunk_index: int) -> int:
@@ -91,13 +157,16 @@ class MilvusChunkStore:
         chunk_texts: List[str],
         embedder: EmbeddingModel,
         batch_size: int = 256,
+        index_config: Optional[MilvusIndexConfig] = None,
     ) -> int:
         if not chunk_texts:
             return 0
         passages = [prepare_passage(embedder.name, t) for t in chunk_texts]
         vecs = embedder.encode(passages)
         dim = int(vecs.shape[1])
-        self._ensure_collection(dim)
+        idx_cfg = index_config or MilvusIndexConfig()
+        self._ensure_collection(dim, metric_type=idx_cfg.metric_type)
+        self._ensure_index(idx_cfg)
 
         rows = []
         for i, text in enumerate(chunk_texts):
@@ -126,19 +195,32 @@ class MilvusChunkStore:
         query: str,
         embedder: EmbeddingModel,
         top_k: int,
+        search_config: Optional[MilvusSearchConfig] = None,
+        index_type: str = "AUTOINDEX",
     ) -> List[dict]:
         if top_k <= 0:
             return []
+        s_cfg = search_config or MilvusSearchConfig()
+        idx_type = (index_type or "AUTOINDEX").upper()
         q = prepare_query(embedder.name, query)
         q_vec = embedder.encode([q])[0].tolist()
         # Collection is created on first upsert; search before any sync had no collection.
-        self._ensure_collection(len(q_vec))
+        self._ensure_collection(len(q_vec), metric_type=s_cfg.metric_type)
+        search_params: dict[str, Any] = {
+            "metric_type": (s_cfg.metric_type or "COSINE").upper(),
+            "params": {},
+        }
+        if idx_type == "IVF_FLAT":
+            search_params["params"] = {"nprobe": int(s_cfg.ivf_nprobe)}
+        elif idx_type == "HNSW":
+            search_params["params"] = {"ef": int(s_cfg.hnsw_ef)}
         out = self._client.search(
             collection_name=self.settings.collection,
             data=[q_vec],
             filter=f'job_id == "{job_id}"',
             limit=int(top_k),
             output_fields=["job_id", "chunk_index", "text"],
+            search_params=search_params,
         )
         hits = out[0] if out else []
         rows: List[dict] = []

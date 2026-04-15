@@ -85,7 +85,10 @@ from src.hybrid_retrieval import BM25Resources, build_bm25_resources, fused_top_
 from src.reranker import Reranker, load_reranker
 from src.retriever import FaissIndex, search
 from src.storage.minio_artifacts import MinioArtifactStore, load_minio_settings
-from src.storage.milvus_store import MilvusChunkStore
+from src.storage.milvus_store import (
+    MilvusChunkStore,
+    MilvusSearchConfig,
+)
 from src.storage.redis_jobs import RedisJobStore
 from src.storage.redis_semantic_cache import RedisSemanticCache
 from src.streaming_parser import HiddenReasoningStreamParser, strip_hidden_reasoning_text
@@ -110,6 +113,46 @@ from src.metrics import (
 
 DEFAULT_EMBED = "BAAI/bge-base-en-v1.5"
 DEFAULT_RERANK = "BAAI/bge-reranker-base"
+MILVUS_INDEX_TYPES = ["AUTOINDEX", "IVF_FLAT", "HNSW"]
+MILVUS_METRICS = ["COSINE", "IP", "L2"]
+MILVUS_PRESETS: Dict[str, Dict[str, Any]] = {
+    "fast": {
+        "index_type": "AUTOINDEX",
+        "metric_type": "COSINE",
+        "upsert_batch_size": 512,
+        "ivf_nlist": 256,
+        "hnsw_m": 8,
+        "hnsw_ef_construction": 100,
+        "ivf_nprobe": 8,
+        "hnsw_ef": 32,
+    },
+    "balanced": {
+        "index_type": "HNSW",
+        "metric_type": "COSINE",
+        "upsert_batch_size": 256,
+        "ivf_nlist": 1024,
+        "hnsw_m": 16,
+        "hnsw_ef_construction": 200,
+        "ivf_nprobe": 32,
+        "hnsw_ef": 64,
+    },
+    "high_recall": {
+        "index_type": "IVF_FLAT",
+        "metric_type": "COSINE",
+        "upsert_batch_size": 128,
+        "ivf_nlist": 2048,
+        "hnsw_m": 32,
+        "hnsw_ef_construction": 320,
+        "ivf_nprobe": 96,
+        "hnsw_ef": 128,
+    },
+}
+
+
+def _milvus_preset_values(name: str) -> Dict[str, Any]:
+    return dict(MILVUS_PRESETS.get(name, MILVUS_PRESETS["balanced"]))
+
+
 RAG_SYSTEM_PROMPT = (
     "You are a grounded RAG assistant. Use only provided context. "
     "If evidence is insufficient, say unknown."
@@ -632,6 +675,8 @@ def _retrieve_rows_for_query(
     vdb_backend: str = "faiss",
     milvus_store: Optional[MilvusChunkStore] = None,
     milvus_job_id: Optional[str] = None,
+    milvus_index_type: str = "AUTOINDEX",
+    milvus_search_config: Optional[MilvusSearchConfig] = None,
     retrieval_mode: str = "dense",
     bm25_resources: Optional[BM25Resources] = None,
     fusion_list_k: Optional[int] = None,
@@ -647,6 +692,8 @@ def _retrieve_rows_for_query(
             query=query,
             embedder=embedder,
             top_k=top_k,
+            search_config=milvus_search_config,
+            index_type=milvus_index_type,
         )
     # FAISS backend: allow dense-only or hybrid BM25+dense (RRF).
     if retrieval_mode == "hybrid" and bm25_resources is not None:
@@ -724,6 +771,8 @@ def run_pipeline(
     vdb_backend: str = "faiss",
     milvus_store: Optional[MilvusChunkStore] = None,
     milvus_job_id: Optional[str] = None,
+    milvus_index_type: str = "AUTOINDEX",
+    milvus_search_config: Optional[MilvusSearchConfig] = None,
     semantic_cache: Optional[RedisSemanticCache] = None,
     semantic_cache_threshold: float = 0.93,
     semantic_cache_max_entries: int = 512,
@@ -753,12 +802,13 @@ def run_pipeline(
                 "require_citations": require_citations,
                 "history_chars": len(history or ""),
                 "retrieval_mode": retrieval_mode,
+                "milvus_index_type": milvus_index_type,
             },
         }
     )
     if k <= 0:
         return {
-            "error": "No index loaded.",
+            "error": "No job loaded.",
             "retrieved": [],
             "rerank_rows": [],
             "final_passages": [],
@@ -857,6 +907,8 @@ def run_pipeline(
             vdb_backend=vdb_backend,
             milvus_store=milvus_store,
             milvus_job_id=milvus_job_id,
+            milvus_index_type=milvus_index_type,
+            milvus_search_config=milvus_search_config,
             retrieval_mode=retrieval_mode,
             bm25_resources=bm25_resources,
             fusion_list_k=fusion_list_k,
@@ -1120,6 +1172,8 @@ def run_pipeline(
                 vdb_backend=vdb_backend,
                 milvus_store=milvus_store,
                 milvus_job_id=milvus_job_id,
+                milvus_index_type=milvus_index_type,
+                milvus_search_config=milvus_search_config,
                 retrieval_mode=retrieval_mode,
                 bm25_resources=bm25_resources,
                 fusion_list_k=fusion_list_k,
@@ -1307,7 +1361,7 @@ def run_pipeline(
 def render_rag_trace(result: dict, *, ui_id: int, final_k: int) -> None:
     fk = int(final_k)
     tab_chunks, tab_rerank, tab_prompt = st.tabs(
-        ["Retrieved chunks (FAISS)", "Reranking (cross-encoder)", "Final prompt & answer"]
+        ["Retrieved chunks (vector search)", "Reranking (cross-encoder)", "Final prompt & answer"]
     )
 
     with tab_chunks:
@@ -1324,9 +1378,7 @@ def render_rag_trace(result: dict, *, ui_id: int, final_k: int) -> None:
             st.caption(
                 f"LLM filter include={filt.get('include', [])} exclude={filt.get('exclude', [])}"
             )
-        st.markdown(
-            "Top-K from bi-encoder + FAISS (inner product on normalized vectors ≈ cosine similarity)."
-        )
+        st.markdown("Top-K from bi-encoder vector search (cosine-style similarity).")
         for row in result["retrieved"]:
             with st.expander(
                 f"Rank {row['faiss_rank']} · chunk #{row['chunk_index']} · {row['faiss_score']:.4f}"
@@ -1344,12 +1396,12 @@ def render_rag_trace(result: dict, *, ui_id: int, final_k: int) -> None:
 
     with tab_rerank:
         if not result["use_rerank"]:
-            st.info("Reranking off — using FAISS order for final passages.")
+            st.info("Reranking off — using retrieval order for final passages.")
         elif not result["rerank_rows"]:
             st.warning("Empty pool.")
         else:
             for row in result["rerank_rows"]:
-                with st.expander(f"CE rank {row['new_rank']} (was FAISS #{row['faiss_rank']}) · {row['cross_encoder_score']:.4f}"):
+                with st.expander(f"CE rank {row['new_rank']} (was retrieval #{row['faiss_rank']}) · {row['cross_encoder_score']:.4f}"):
                     st.text_area(
                         "Passage",
                         row["text"],
@@ -1949,9 +2001,9 @@ def unload_index() -> None:
 
 
 def load_job(job_id: str) -> None:
-    chunks, faiss_index, meta = load_ingest_from_minio(job_id.strip())
+    chunks, meta = load_ingest_from_minio(job_id.strip())
     st.session_state.corpus_chunks = chunks
-    st.session_state.faiss_index = faiss_index
+    st.session_state.faiss_index = None
     st.session_state.ingest_meta = meta
     fn = meta.get("filename") or "document"
     st.session_state.source_label = f"{job_id.strip()} · {fn}"
@@ -2068,7 +2120,7 @@ def main() -> None:
 
 
 def _ui_ingest_pipeline() -> None:
-    st.caption("Upload → filter → extract → chunk & summarize → embed → **MinIO** + **Redis**")
+    st.caption("Upload → filter → extract → chunk & summarize → embed/upsert (**Milvus**) → **MinIO** + **Redis**")
 
     st.subheader("1 — Upload & page filter")
     up_col, filt_col = st.columns(2)
@@ -2099,6 +2151,59 @@ def _ui_ingest_pipeline() -> None:
             "Summarizer LLM (if not single)",
             ["mock", "gemini", "openai", "ollama"],
         )
+    with st.expander("Milvus index options", expanded=False):
+        ingest_preset = st.selectbox(
+            "Milvus preset",
+            ["fast", "balanced", "high_recall", "custom"],
+            index=1,
+            help="Preset fills sensible defaults; choose custom to tune each option manually.",
+        )
+        pvals = _milvus_preset_values(ingest_preset if ingest_preset != "custom" else "balanced")
+        mi1, mi2, mi3 = st.columns(3)
+        with mi1:
+            milvus_index_type = st.selectbox(
+                "Index type",
+                MILVUS_INDEX_TYPES,
+                index=MILVUS_INDEX_TYPES.index(str(pvals["index_type"])),
+            )
+            milvus_metric_type = st.selectbox(
+                "Metric",
+                MILVUS_METRICS,
+                index=MILVUS_METRICS.index(str(pvals["metric_type"])),
+            )
+            milvus_upsert_batch_size = st.slider(
+                "Upsert batch size",
+                32,
+                1024,
+                int(pvals["upsert_batch_size"]),
+                32,
+            )
+        with mi2:
+            milvus_ivf_nlist = st.slider(
+                "IVF nlist",
+                64,
+                4096,
+                int(pvals["ivf_nlist"]),
+                64,
+                disabled=milvus_index_type != "IVF_FLAT",
+            )
+        with mi3:
+            milvus_hnsw_m = st.slider(
+                "HNSW M",
+                4,
+                64,
+                int(pvals["hnsw_m"]),
+                2,
+                disabled=milvus_index_type != "HNSW",
+            )
+            milvus_hnsw_ef_construction = st.slider(
+                "HNSW efConstruction",
+                32,
+                512,
+                int(pvals["hnsw_ef_construction"]),
+                8,
+                disabled=milvus_index_type != "HNSW",
+            )
 
     st.subheader("4 — Run → MinIO + Redis")
     if st.button("Run full pipeline", type="primary"):
@@ -2111,6 +2216,12 @@ def _ui_ingest_pipeline() -> None:
                     chunk_overlap=int(chunk_overlap),
                     extraction=extraction,  # type: ignore[arg-type]
                     summarization=strat,  # type: ignore[arg-type]
+                    milvus_index_type=str(milvus_index_type),
+                    milvus_metric_type=str(milvus_metric_type),
+                    milvus_ivf_nlist=int(milvus_ivf_nlist),
+                    milvus_hnsw_m=int(milvus_hnsw_m),
+                    milvus_hnsw_ef_construction=int(milvus_hnsw_ef_construction),
+                    milvus_upsert_batch_size=int(milvus_upsert_batch_size),
                 )
                 summ = ingest_summarizer(summ_backend) if strat != "single" else None
                 with st.spinner("Running pipeline…"):
@@ -2170,7 +2281,7 @@ def _ui_library() -> None:
     st.divider()
     st.subheader("Remove from library")
     st.caption(
-        "Deletes the job prefix in MinIO (chunks, FAISS index, metadata). "
+        "Deletes the job prefix in MinIO (chunks + metadata). "
         "Optional: clears Redis ingest status. If this job is loaded in **Query**, memory is unloaded."
     )
     options = [r["job_id"] for r in rows]
@@ -2226,7 +2337,7 @@ def _job_label_for_select(row: dict[str, Any]) -> str:
 
 
 def _ui_query() -> None:
-    st.caption("Attach an index from MinIO, then ask questions. **Attach** checked + **Load** = fetch index; **Attach** unchecked + **Load** = unload.")
+    st.caption("Attach an ingest job from MinIO, then ask questions. Retrieval is Milvus-only.")
 
     try:
         jobs = _minio_store().list_ingest_jobs_table()
@@ -2234,20 +2345,20 @@ def _ui_query() -> None:
         st.error(f"MinIO: {e}")
         return
 
-    st.subheader("Index in memory")
-    if st.session_state.loaded_job_id and st.session_state.faiss_index is not None:
+    st.subheader("Loaded job context")
+    if st.session_state.loaded_job_id and len(st.session_state.corpus_chunks) > 0:
         st.success(
             f"Loaded **{st.session_state.loaded_job_id}** — "
             f"{len(st.session_state.corpus_chunks)} chunks · {st.session_state.source_label}"
         )
     else:
-        st.warning("No index loaded.")
+        st.warning("No job loaded.")
 
     st.subheader("Attach & load")
     attach = st.checkbox(
-        "Attach index for querying",
+        "Attach job for querying",
         value=True,
-        help="Checked: **Load** downloads the selected job into memory. Unchecked: **Load** clears the index (unload).",
+        help="Checked: **Load** downloads the selected job metadata/chunks. Unchecked: **Load** clears loaded job context.",
     )
 
     options: List[str] = [r["job_id"] for r in jobs]
@@ -2281,29 +2392,64 @@ def _ui_query() -> None:
                     st.exception(e)
         else:
             unload_index()
-            st.success("Index unloaded from memory.")
+            st.success("Job unloaded from memory.")
             st.rerun()
 
     ready = (
-        st.session_state.faiss_index is not None
+        st.session_state.loaded_job_id is not None
         and len(st.session_state.corpus_chunks) > 0
     )
+    ingest_meta = st.session_state.get("ingest_meta", {}) or {}
+    default_milvus_index_type = str(ingest_meta.get("milvus_index_type", "AUTOINDEX"))
+    default_milvus_metric_type = str(ingest_meta.get("milvus_metric_type", "COSINE"))
+    query_preset_default = "balanced"
 
     chat_bar_options_col, _ = st.columns([1, 6])
     with chat_bar_options_col:
         with st.popover("Options", disabled=not ready):
             st.caption("Attached chat options")
-            vdb_backend = st.selectbox(
-                "Vector DB backend",
-                ["faiss", "milvus"],
+            vdb_backend = "milvus"
+            retrieval_mode = "dense"
+            st.caption("Vector backend: **milvus**")
+            query_preset = st.selectbox(
+                "Milvus search preset",
+                ["fast", "balanced", "high_recall", "custom"],
+                index=["fast", "balanced", "high_recall", "custom"].index(query_preset_default),
                 disabled=not ready,
-                help="faiss = in-memory local index, milvus = remote vector database",
+                help="Preset sets query-time ANN params. Custom lets you override manually.",
             )
-            retrieval_mode = st.selectbox(
-                "ANN retrieval mode",
-                ["dense", "hybrid"],
-                disabled=not ready or vdb_backend != "faiss",
-                help="dense = embedding-only FAISS; hybrid = BM25 + dense merged with RRF (FAISS backend only).",
+            qvals = _milvus_preset_values(query_preset if query_preset != "custom" else "balanced")
+            milvus_index_type = st.selectbox(
+                "Milvus index type",
+                MILVUS_INDEX_TYPES,
+                index=MILVUS_INDEX_TYPES.index(default_milvus_index_type)
+                if default_milvus_index_type in MILVUS_INDEX_TYPES
+                else 0,
+                disabled=not ready,
+            )
+            milvus_metric_type = st.selectbox(
+                "Milvus metric",
+                MILVUS_METRICS,
+                index=MILVUS_METRICS.index(default_milvus_metric_type)
+                if default_milvus_metric_type in MILVUS_METRICS
+                else 0,
+                disabled=not ready,
+            )
+            milvus_ivf_nprobe = st.slider(
+                "Milvus IVF nprobe",
+                1,
+                256,
+                int(qvals["ivf_nprobe"]),
+                1,
+                disabled=not ready or milvus_index_type != "IVF_FLAT",
+            )
+            milvus_hnsw_ef = st.slider(
+                "Milvus HNSW ef",
+                8,
+                512,
+                int(qvals["hnsw_ef"]),
+                8,
+                disabled=not ready or milvus_index_type not in ("HNSW", "AUTOINDEX"),
             )
             fusion_list_k = st.slider(
                 "Hybrid fusion list K",
@@ -2311,7 +2457,7 @@ def _ui_query() -> None:
                 100,
                 30,
                 5,
-                disabled=not ready or vdb_backend != "faiss" or retrieval_mode != "hybrid",
+                disabled=True,
                 help="Candidates taken from each retriever (BM25 and dense) before RRF merge.",
             )
             rrf_k = st.slider(
@@ -2320,10 +2466,10 @@ def _ui_query() -> None:
                 200,
                 60,
                 5,
-                disabled=not ready or vdb_backend != "faiss" or retrieval_mode != "hybrid",
+                disabled=True,
                 help="RRF smoothing constant; larger values flatten rank contribution.",
             )
-            retrieve_k = st.slider("FAISS top-K", 3, 30, 10, disabled=not ready)
+            retrieve_k = st.slider("Retrieval top-K", 3, 30, 10, disabled=not ready)
             final_k = st.slider("Final passages to LLM", 1, 10, 3, disabled=not ready)
             use_semantic_cache = st.checkbox(
                 "Redis semantic cache",
@@ -2408,8 +2554,12 @@ def _ui_query() -> None:
 
     # Defaults when options popover is disabled (no index loaded yet)
     if not ready:
-        vdb_backend = "faiss"
+        vdb_backend = "milvus"
         retrieval_mode = "dense"
+        milvus_index_type = default_milvus_index_type
+        milvus_metric_type = default_milvus_metric_type
+        milvus_ivf_nprobe = 32
+        milvus_hnsw_ef = 64
         fusion_list_k = 30
         rrf_k = 60
         retrieve_k = 10
@@ -2448,22 +2598,6 @@ def _ui_query() -> None:
             height=72,
         )
 
-    if st.session_state.loaded_job_id:
-        sync_col, _ = st.columns([1.2, 4.8])
-        with sync_col:
-            if st.button("Sync loaded job to Milvus"):
-                try:
-                    with st.spinner("Connecting to Milvus (set MILVUS_URI; MILVUS_CONNECT_TIMEOUT)…"):
-                        embedder_sync = cached_embedder(DEFAULT_EMBED)
-                        n = _milvus_store().upsert_job_chunks(
-                            job_id=st.session_state.loaded_job_id,
-                            chunk_texts=st.session_state.corpus_chunks,
-                            embedder=embedder_sync,
-                        )
-                    st.success(f"Upserted {n} chunks to Milvus.")
-                except Exception as e:
-                    st.error(f"Milvus sync failed: {e}")
-
     result = st.session_state.get("last_rag")
     convo_col, trace_col = st.columns([1.35, 1.0])
     with convo_col:
@@ -2486,23 +2620,26 @@ def _ui_query() -> None:
     if question and question.strip():
         embedder = cached_embedder(DEFAULT_EMBED)
         reranker = cached_reranker(DEFAULT_RERANK) if use_rerank else None
+        milvus_search_config = MilvusSearchConfig(
+            metric_type=str(milvus_metric_type),
+            ivf_nprobe=int(milvus_ivf_nprobe),
+            hnsw_ef=int(milvus_hnsw_ef),
+        )
         try:
             gen = make_generator(backend)
         except Exception as e:
             st.error(f"Generator: {e}")
             return
         milvus_store = None
-        if vdb_backend == "milvus":
-            try:
-                with st.spinner("Connecting to Milvus…"):
-                    milvus_store = _milvus_store()
-            except Exception as e:
-                st.error(
-                    f"Milvus backend unavailable: {e}\n\n"
-                    "Start Milvus (e.g. docker) and set `MILVUS_URI` in `.env`. "
-                    "Use **faiss** backend if Milvus is not running."
-                )
-                return
+        try:
+            with st.spinner("Connecting to Milvus…"):
+                milvus_store = _milvus_store()
+        except Exception as e:
+            st.error(
+                f"Milvus backend unavailable: {e}\n\n"
+                "Start Milvus (e.g. docker) and set `MILVUS_URI` in `.env`."
+            )
+            return
         semantic_cache = None
         if use_semantic_cache:
             try:
@@ -2547,6 +2684,8 @@ def _ui_query() -> None:
                 vdb_backend=vdb_backend,
                 milvus_store=milvus_store,
                 milvus_job_id=st.session_state.loaded_job_id,
+                milvus_index_type=str(milvus_index_type),
+                milvus_search_config=milvus_search_config,
                 semantic_cache=semantic_cache,
                 semantic_cache_threshold=float(semantic_cache_threshold),
                 retrieval_mode=retrieval_mode,
@@ -2590,6 +2729,10 @@ def _ui_query() -> None:
                     "rrf_k": int(rrf_k),
                     "retrieval_mode": retrieval_mode,
                     "vdb_backend": vdb_backend,
+                    "milvus_index_type": str(milvus_index_type),
+                    "milvus_metric_type": str(milvus_metric_type),
+                    "milvus_ivf_nprobe": int(milvus_ivf_nprobe),
+                    "milvus_hnsw_ef": int(milvus_hnsw_ef),
                     "max_context_chars": int(max_context_chars),
                     "truncation": str(truncation),
                     "template_key": template_key,
