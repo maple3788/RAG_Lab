@@ -2512,23 +2512,18 @@ def _ui_query() -> None:
                 help="Preset sets query-time ANN params. Custom lets you override manually.",
             )
             qvals = _milvus_preset_values(query_preset if query_preset != "custom" else "balanced")
-            milvus_index_type = st.selectbox(
-                "Milvus index type",
-                MILVUS_INDEX_TYPES,
-                index=MILVUS_INDEX_TYPES.index(default_milvus_index_type)
+            milvus_index_type = (
+                default_milvus_index_type
                 if default_milvus_index_type in MILVUS_INDEX_TYPES
-                else 0,
-                disabled=not ready,
-                help="Expected index family for this loaded collection; controls which query-time knobs are applied.",
+                else "AUTOINDEX"
             )
-            milvus_metric_type = st.selectbox(
-                "Milvus metric",
-                MILVUS_METRICS,
-                index=MILVUS_METRICS.index(default_milvus_metric_type)
+            milvus_metric_type = (
+                default_milvus_metric_type
                 if default_milvus_metric_type in MILVUS_METRICS
-                else 0,
-                disabled=not ready,
-                help="Distance metric used at query time. Should match the collection/index metric used at ingest.",
+                else "COSINE"
+            )
+            st.caption(
+                f"Loaded collection index: **{milvus_index_type}** · metric: **{milvus_metric_type}**"
             )
             milvus_ivf_nprobe = st.slider(
                 "Milvus IVF nprobe",
@@ -2713,8 +2708,16 @@ def _ui_query() -> None:
     if not ready:
         vdb_backend = "milvus"
         retrieval_mode = "dense"
-        milvus_index_type = default_milvus_index_type
-        milvus_metric_type = default_milvus_metric_type
+        milvus_index_type = (
+            default_milvus_index_type
+            if default_milvus_index_type in MILVUS_INDEX_TYPES
+            else "AUTOINDEX"
+        )
+        milvus_metric_type = (
+            default_milvus_metric_type
+            if default_milvus_metric_type in MILVUS_METRICS
+            else "COSINE"
+        )
         milvus_ivf_nprobe = 32
         milvus_hnsw_ef = 64
         fusion_list_k = 30
