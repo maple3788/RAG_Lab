@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from time import perf_counter
+from traceback import format_exc
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -57,6 +58,8 @@ class RAGGenerationConfig:
     semantic_cache_max_entries: int = 512
     #: Optional fallback: rewrite query once if no passages were retrieved.
     rewrite_on_empty_retrieval: bool = False
+    #: If true, record per-example failures and continue evaluation instead of raising.
+    continue_on_error: bool = True
 
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -105,6 +108,7 @@ def evaluate_rag_answer_quality(
     lat_rewrite_ms: List[float] = []
     cache_hits = 0.0
     cache_lookups = 0.0
+    failures = 0.0
     semantic_cache: List[Tuple[np.ndarray, str]] = []
     per_example_rows: List[Dict[str, Any]] = []
 
@@ -113,87 +117,94 @@ def evaluate_rag_answer_quality(
             return list(ex.answer_aliases)
         return [ex.answer]
 
+    def _record_failure(
+        ex: QAExample,
+        *,
+        prediction: str = "",
+        passages: Optional[Sequence[str]] = None,
+        retrieve_ms: float = 0.0,
+        rewrite_ms: float = 0.0,
+        generate_ms: float = 0.0,
+        error: str,
+        error_traceback: Optional[str] = None,
+        token_count: int = 1,
+    ) -> None:
+        nonlocal failures
+        failures += 1.0
+        ems.append(0.0)
+        f1s.append(0.0)
+        hits.append(0.0)
+        lat_retrieve_ms.append(retrieve_ms)
+        lat_rewrite_ms.append(rewrite_ms)
+        lat_generate_ms.append(generate_ms)
+        lat_total_ms.append((perf_counter() - t0_total) * 1000.0)
+        if return_per_example:
+            row: Dict[str, Any] = {
+                "question": ex.question,
+                "reference_answer": ex.answer,
+                "prediction": prediction,
+                "retrieved_passages": list(passages or []),
+                "token_f1": 0.0,
+                "gold_hit": 0.0,
+                "exact_match": 0.0,
+                "latency_total_ms": lat_total_ms[-1],
+                "token_count": token_count,
+                "error": error,
+            }
+            if error_traceback is not None:
+                row["error_traceback"] = error_traceback
+            per_example_rows.append(row)
+
     for ex in examples:
         t0_total = perf_counter()
         cache_lookups += 1.0
         cached_prediction: Optional[str] = None
+        passages: List[str] = []
+        rewrite_ms = 0.0
+        retrieve_ms = 0.0
+        generate_ms = 0.0
+        q_emb: Optional[np.ndarray] = None
 
-        if config.use_semantic_cache:
-            q_text = prepare_query(embedder.name, ex.question)
-            q_emb = embedder.encode([q_text])[0]
-            best_sim = -1.0
-            best_answer = None
-            for emb, ans in semantic_cache:
-                sim = _cosine_similarity(q_emb, emb)
-                if sim > best_sim:
-                    best_sim = sim
-                    best_answer = ans
-            if best_answer is not None and best_sim >= config.semantic_cache_threshold:
-                cache_hits += 1.0
-                cached_prediction = best_answer
+        try:
+            if config.use_semantic_cache:
+                q_text = prepare_query(embedder.name, ex.question)
+                q_emb = embedder.encode([q_text])[0]
+                best_sim = -1.0
+                best_answer = None
+                for emb, ans in semantic_cache:
+                    sim = _cosine_similarity(q_emb, emb)
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_answer = ans
+                if best_answer is not None and best_sim >= config.semantic_cache_threshold:
+                    cache_hits += 1.0
+                    cached_prediction = best_answer
 
-        if config.per_example_retrieval:
-            chunks = build_corpus_chunks_from_documents(
-                list(ex.contexts),
-                chunk_size=config.chunk_size,
-                chunk_overlap=config.chunk_overlap,
-            )
-            if not chunks:
-                ems.append(0.0)
-                f1s.append(0.0)
-                hits.append(0.0)
-                lat_retrieve_ms.append(0.0)
-                lat_generate_ms.append(0.0)
-                lat_rewrite_ms.append(0.0)
-                lat_total_ms.append((perf_counter() - t0_total) * 1000.0)
-                if return_per_example:
-                    per_example_rows.append(
-                        {
-                            "question": ex.question,
-                            "reference_answer": ex.answer,
-                            "prediction": "",
-                            "retrieved_passages": [],
-                            "token_f1": 0.0,
-                            "gold_hit": 0.0,
-                            "exact_match": 0.0,
-                            "latency_total_ms": lat_total_ms[-1],
-                            "token_count": 1,
-                        }
+            if config.per_example_retrieval:
+                chunks = build_corpus_chunks_from_documents(
+                    list(ex.contexts),
+                    chunk_size=config.chunk_size,
+                    chunk_overlap=config.chunk_overlap,
+                )
+                if not chunks:
+                    _record_failure(
+                        ex,
+                        passages=[],
+                        error="No chunks available for per-example retrieval.",
                     )
-                continue
-            fi = build_retrieval_index(embedder, chunks)
-            bm25 = (
-                build_bm25_resources(chunks)
-                if config.use_hybrid
-                else None
-            )
-            fusion = config.fusion_list_k
-            if bm25 is not None and fusion is None:
-                fusion = len(chunks)
-            t0_retrieve = perf_counter()
-            passages = [] if cached_prediction is not None else retrieve_passages_for_query(
-                ex.question,
-                embedder,
-                chunks,
-                fi,
-                retrieve_k=config.retrieve_k,
-                reranker=reranker if config.use_rerank else None,
-                final_k=config.final_k,
-                bm25_resources=bm25,
-                rrf_k=config.rrf_k,
-                fusion_list_k=fusion,
-            )
-            rewrite_ms = 0.0
-            if (
-                cached_prediction is None
-                and config.rewrite_on_empty_retrieval
-                and not passages
-            ):
-                t0_rewrite = perf_counter()
-                rewritten = _rewrite_query(generator, ex.question)
-                rewrite_ms = (perf_counter() - t0_rewrite) * 1000.0
-                passages = retrieve_passages_for_query(
-                    rewritten,
+                    continue
+                fi = build_retrieval_index(embedder, chunks)
+                bm25 = (
+                    build_bm25_resources(chunks)
+                    if config.use_hybrid
+                    else None
+                )
+                fusion = config.fusion_list_k
+                if bm25 is not None and fusion is None:
+                    fusion = len(chunks)
+                t0_retrieve = perf_counter()
+                passages = [] if cached_prediction is not None else retrieve_passages_for_query(
+                    ex.question,
                     embedder,
                     chunks,
                     fi,
@@ -204,30 +215,33 @@ def evaluate_rag_answer_quality(
                     rrf_k=config.rrf_k,
                     fusion_list_k=fusion,
                 )
-            lat_retrieve_ms.append((perf_counter() - t0_retrieve) * 1000.0)
-            lat_rewrite_ms.append(rewrite_ms)
-        else:
-            t0_retrieve = perf_counter()
-            passages = [] if cached_prediction is not None else retrieve_passages_for_query(
-                ex.question,
-                embedder,
-                corpus_chunks,
-                faiss_index,  # type: ignore[arg-type]
-                retrieve_k=config.retrieve_k,
-                reranker=reranker if config.use_rerank else None,
-                final_k=config.final_k,
-            )
-            rewrite_ms = 0.0
-            if (
-                cached_prediction is None
-                and config.rewrite_on_empty_retrieval
-                and not passages
-            ):
-                t0_rewrite = perf_counter()
-                rewritten = _rewrite_query(generator, ex.question)
-                rewrite_ms = (perf_counter() - t0_rewrite) * 1000.0
-                passages = retrieve_passages_for_query(
-                    rewritten,
+                if (
+                    cached_prediction is None
+                    and config.rewrite_on_empty_retrieval
+                    and not passages
+                ):
+                    t0_rewrite = perf_counter()
+                    rewritten = _rewrite_query(generator, ex.question)
+                    rewrite_ms = (perf_counter() - t0_rewrite) * 1000.0
+                    passages = retrieve_passages_for_query(
+                        rewritten,
+                        embedder,
+                        chunks,
+                        fi,
+                        retrieve_k=config.retrieve_k,
+                        reranker=reranker if config.use_rerank else None,
+                        final_k=config.final_k,
+                        bm25_resources=bm25,
+                        rrf_k=config.rrf_k,
+                        fusion_list_k=fusion,
+                    )
+                retrieve_ms = (perf_counter() - t0_retrieve) * 1000.0
+                lat_retrieve_ms.append(retrieve_ms)
+                lat_rewrite_ms.append(rewrite_ms)
+            else:
+                t0_retrieve = perf_counter()
+                passages = [] if cached_prediction is not None else retrieve_passages_for_query(
+                    ex.question,
                     embedder,
                     corpus_chunks,
                     faiss_index,  # type: ignore[arg-type]
@@ -235,45 +249,77 @@ def evaluate_rag_answer_quality(
                     reranker=reranker if config.use_rerank else None,
                     final_k=config.final_k,
                 )
-            lat_retrieve_ms.append((perf_counter() - t0_retrieve) * 1000.0)
-            lat_rewrite_ms.append(rewrite_ms)
-        raw_context = passages_to_context(passages)
-        context = truncate_context(
-            raw_context, config.max_context_chars, config.truncation
-        )
-        prompt = format_rag_prompt(
-            config.prompt_template, context=context, question=ex.question
-        )
-        t0_generate = perf_counter()
-        prediction = cached_prediction if cached_prediction is not None else generator.generate(prompt)
-        lat_generate_ms.append((perf_counter() - t0_generate) * 1000.0)
+                if (
+                    cached_prediction is None
+                    and config.rewrite_on_empty_retrieval
+                    and not passages
+                ):
+                    t0_rewrite = perf_counter()
+                    rewritten = _rewrite_query(generator, ex.question)
+                    rewrite_ms = (perf_counter() - t0_rewrite) * 1000.0
+                    passages = retrieve_passages_for_query(
+                        rewritten,
+                        embedder,
+                        corpus_chunks,
+                        faiss_index,  # type: ignore[arg-type]
+                        retrieve_k=config.retrieve_k,
+                        reranker=reranker if config.use_rerank else None,
+                        final_k=config.final_k,
+                    )
+                retrieve_ms = (perf_counter() - t0_retrieve) * 1000.0
+                lat_retrieve_ms.append(retrieve_ms)
+                lat_rewrite_ms.append(rewrite_ms)
+            raw_context = passages_to_context(passages)
+            context = truncate_context(
+                raw_context, config.max_context_chars, config.truncation
+            )
+            prompt = format_rag_prompt(
+                config.prompt_template, context=context, question=ex.question
+            )
+            t0_generate = perf_counter()
+            prediction = cached_prediction if cached_prediction is not None else generator.generate(prompt)
+            generate_ms = (perf_counter() - t0_generate) * 1000.0
+            lat_generate_ms.append(generate_ms)
 
-        if config.use_semantic_cache and cached_prediction is None:
-            q_text = prepare_query(embedder.name, ex.question)
-            q_emb = embedder.encode([q_text])[0]
-            if len(semantic_cache) >= config.semantic_cache_max_entries:
-                semantic_cache.pop(0)
-            semantic_cache.append((q_emb, prediction))
+            if config.use_semantic_cache and cached_prediction is None:
+                if q_emb is None:
+                    q_text = prepare_query(embedder.name, ex.question)
+                    q_emb = embedder.encode([q_text])[0]
+                if len(semantic_cache) >= config.semantic_cache_max_entries:
+                    semantic_cache.pop(0)
+                semantic_cache.append((q_emb, prediction))
 
-        golds = _gold_strings(ex)
-        ems.append(max(exact_match(prediction, g) for g in golds))
-        f1s.append(max(token_f1(prediction, g) for g in golds))
-        hits.append(max(gold_answer_hit(prediction, g) for g in golds))
-        lat_total_ms.append((perf_counter() - t0_total) * 1000.0)
-        if return_per_example:
-            tok = max(1, (len(prompt) + len(prediction)) // 4)
-            per_example_rows.append(
-                {
-                    "question": ex.question,
-                    "reference_answer": ex.answer,
-                    "prediction": prediction,
-                    "retrieved_passages": list(passages),
-                    "token_f1": f1s[-1],
-                    "gold_hit": hits[-1],
-                    "exact_match": ems[-1],
-                    "latency_total_ms": lat_total_ms[-1],
-                    "token_count": tok,
-                }
+            golds = _gold_strings(ex)
+            ems.append(max(exact_match(prediction, g) for g in golds))
+            f1s.append(max(token_f1(prediction, g) for g in golds))
+            hits.append(max(gold_answer_hit(prediction, g) for g in golds))
+            lat_total_ms.append((perf_counter() - t0_total) * 1000.0)
+            if return_per_example:
+                tok = max(1, (len(prompt) + len(prediction)) // 4)
+                per_example_rows.append(
+                    {
+                        "question": ex.question,
+                        "reference_answer": ex.answer,
+                        "prediction": prediction,
+                        "retrieved_passages": list(passages),
+                        "token_f1": f1s[-1],
+                        "gold_hit": hits[-1],
+                        "exact_match": ems[-1],
+                        "latency_total_ms": lat_total_ms[-1],
+                        "token_count": tok,
+                    }
+                )
+        except Exception as e:
+            if not config.continue_on_error:
+                raise
+            _record_failure(
+                ex,
+                passages=passages,
+                retrieve_ms=retrieve_ms,
+                rewrite_ms=rewrite_ms,
+                generate_ms=generate_ms,
+                error=str(e),
+                error_traceback=format_exc(),
             )
 
     out: Dict[str, Any] = {
@@ -286,6 +332,7 @@ def evaluate_rag_answer_quality(
         "latency_generate_ms": mean(lat_generate_ms),
         "semantic_cache_hit_rate": (cache_hits / cache_lookups) if cache_lookups > 0 else 0.0,
         "n_questions": float(len(examples)),
+        "n_failures": failures,
     }
     if return_per_example:
         out["per_example"] = per_example_rows

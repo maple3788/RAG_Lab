@@ -67,6 +67,16 @@ class QueryResponse(BaseModel):
     retrieved_chunks: list[str] = []
 
 
+class QueryErrorResponse(BaseModel):
+    error: str
+    stage: str
+    latency_ms: float = 0.0
+    retrieval_latency_ms: float = 0.0
+    generation_latency_ms: float = 0.0
+    cache_hit: str = "none"
+    retrieved_chunks: list[str] = []
+
+
 @dataclass
 class CacheItem:
     value: QueryResponse
@@ -108,6 +118,39 @@ _l1_cache = TTLCache(
 )
 _key_locks: dict[str, asyncio.Lock] = {}
 _generation_sem = asyncio.Semaphore(int(os.environ.get("RAG_MAX_GENERATION_CONCURRENCY", "8")))
+
+
+class QueryStageError(Exception):
+    def __init__(
+        self,
+        stage: str,
+        message: str,
+        *,
+        status_code: int = 500,
+        retrieval_latency_ms: float = 0.0,
+        generation_latency_ms: float = 0.0,
+        cache_hit: str = "none",
+        retrieved_chunks: Optional[list[str]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.status_code = status_code
+        self.retrieval_latency_ms = retrieval_latency_ms
+        self.generation_latency_ms = generation_latency_ms
+        self.cache_hit = cache_hit
+        self.retrieved_chunks = retrieved_chunks or []
+
+    def to_dict(self) -> dict[str, Any]:
+        total_ms = self.retrieval_latency_ms + self.generation_latency_ms
+        return {
+            "error": str(self),
+            "stage": self.stage,
+            "latency_ms": round(total_ms, 2),
+            "retrieval_latency_ms": round(self.retrieval_latency_ms, 2),
+            "generation_latency_ms": round(self.generation_latency_ms, 2),
+            "cache_hit": self.cache_hit,
+            "retrieved_chunks": self.retrieved_chunks,
+        }
 
 
 def _embed() -> EmbeddingModel:
@@ -206,11 +249,18 @@ async def _run_query(req: QueryRequest) -> QueryResponse:
             return hit2.model_copy(update={"cache_hit": "l1"})
 
         emb = _embed()
-        semantic = RedisSemanticCache(namespace=req.job_id.strip()) if req.use_semantic_cache else None
+        try:
+            semantic = RedisSemanticCache(namespace=req.job_id.strip()) if req.use_semantic_cache else None
+        except Exception as e:
+            raise QueryStageError("semantic_cache_init", f"semantic cache init failed: {e}") from e
         sem_answer: Optional[str] = None
+        q_emb: Optional[Any] = None
         if semantic is not None:
-            q_emb = emb.encode([prepare_query(emb.name, req.question.strip())])[0]
-            sem_answer = semantic.lookup(q_emb, threshold=req.semantic_cache_threshold)
+            try:
+                q_emb = emb.encode([prepare_query(emb.name, req.question.strip())])[0]
+                sem_answer = semantic.lookup(q_emb, threshold=req.semantic_cache_threshold)
+            except Exception as e:
+                raise QueryStageError("semantic_cache_lookup", f"semantic cache lookup failed: {e}") from e
             if sem_answer:
                 CACHE_HIT.labels(layer="semantic").inc()
                 resp = QueryResponse(
@@ -225,11 +275,30 @@ async def _run_query(req: QueryRequest) -> QueryResponse:
                 _l1_cache.set(key, resp)
                 return resp
 
-        rows, retrieval_s = await asyncio.to_thread(_retrieve, req)
+        try:
+            rows, retrieval_s = await asyncio.to_thread(_retrieve, req)
+        except Exception as e:
+            raise QueryStageError("retrieval", f"retrieval failed: {e}") from e
         passages = [r["text"] for r in rows]
-        prompt = _build_prompt(req, passages)
+        try:
+            prompt = _build_prompt(req, passages)
+        except Exception as e:
+            raise QueryStageError(
+                "prompt_build",
+                f"prompt build failed: {e}",
+                retrieval_latency_ms=retrieval_s * 1000.0,
+                retrieved_chunks=passages if req.include_debug else [],
+            ) from e
         async with _generation_sem:
-            answer, gen_s = await asyncio.to_thread(_generate, prompt)
+            try:
+                answer, gen_s = await asyncio.to_thread(_generate, prompt)
+            except Exception as e:
+                raise QueryStageError(
+                    "generation",
+                    f"generation failed: {e}",
+                    retrieval_latency_ms=retrieval_s * 1000.0,
+                    retrieved_chunks=passages if req.include_debug else [],
+                ) from e
 
         total_ms = (retrieval_s + gen_s) * 1000.0
         token_count = approx_token_count(prompt, answer)
@@ -245,14 +314,25 @@ async def _run_query(req: QueryRequest) -> QueryResponse:
         _l1_cache.set(key, resp)
 
         if semantic is not None:
-            q_emb = emb.encode([prepare_query(emb.name, req.question.strip())])[0]
-            semantic.write(
-                question=req.question.strip(),
-                answer=answer,
-                query_embedding=q_emb,
-                max_entries=int(os.environ.get("RAG_SEMANTIC_CACHE_MAX_ENTRIES", "512")),
-                ttl_seconds=int(os.environ.get("RAG_SEMANTIC_CACHE_TTL_SEC", "86400")),
-            )
+            try:
+                if q_emb is None:
+                    q_emb = emb.encode([prepare_query(emb.name, req.question.strip())])[0]
+                semantic.write(
+                    question=req.question.strip(),
+                    answer=answer,
+                    query_embedding=q_emb,
+                    max_entries=int(os.environ.get("RAG_SEMANTIC_CACHE_MAX_ENTRIES", "512")),
+                    ttl_seconds=int(os.environ.get("RAG_SEMANTIC_CACHE_TTL_SEC", "86400")),
+                )
+            except Exception as e:
+                raise QueryStageError(
+                    "semantic_cache_write",
+                    f"semantic cache write failed: {e}",
+                    retrieval_latency_ms=round(retrieval_s * 1000.0, 2),
+                    generation_latency_ms=round(gen_s * 1000.0, 2),
+                    cache_hit="none",
+                    retrieved_chunks=passages if req.include_debug else [],
+                ) from e
         return resp
 
 
@@ -282,6 +362,9 @@ async def query_rag(req: QueryRequest) -> QueryResponse:
     try:
         result = await _run_query(req)
         return result
+    except QueryStageError as e:
+        status = "error"
+        raise HTTPException(status_code=e.status_code, detail=e.to_dict())
     except Exception as e:
         status = "error"
         raise HTTPException(status_code=500, detail=str(e))
@@ -301,8 +384,31 @@ async def batch_rag(req: BatchRequest) -> JSONResponse:
     t0 = time.perf_counter()
     status = "ok"
     try:
-        results = await asyncio.gather(*(_run_query(q) for q in req.queries))
-        return JSONResponse({"results": [r.model_dump() for r in results]})
+        raw_results = await asyncio.gather(*(_run_query(q) for q in req.queries), return_exceptions=True)
+        results: list[dict[str, Any]] = []
+        had_error = False
+        for item in raw_results:
+            if isinstance(item, QueryResponse):
+                results.append(item.model_dump())
+            elif isinstance(item, QueryStageError):
+                had_error = True
+                results.append(QueryErrorResponse(**item.to_dict()).model_dump())
+            elif isinstance(item, Exception):
+                had_error = True
+                results.append(
+                    QueryErrorResponse(error=str(item), stage="unknown").model_dump()
+                )
+            else:
+                had_error = True
+                results.append(
+                    QueryErrorResponse(
+                        error="unknown batch result type",
+                        stage="unknown",
+                    ).model_dump()
+                )
+        if had_error:
+            status = "partial_error"
+        return JSONResponse({"results": results})
     except Exception as e:
         status = "error"
         raise HTTPException(status_code=500, detail=str(e))
