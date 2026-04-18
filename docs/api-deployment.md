@@ -20,6 +20,11 @@ Module: `src/api/server.py`
 Endpoints:
 - `POST /v1/rag/query`
 - `POST /v1/rag/batch`
+- `POST /v1/rag/load`
+- `POST /v1/rag/session`
+- `DELETE /v1/rag/session`
+- `POST /v1/ingest`
+- `GET /v1/jobs`
 - `GET /healthz`
 - `GET /readyz`
 - `GET /metrics`
@@ -61,11 +66,25 @@ curl -X POST "http://localhost:8080/v1/rag/query" \
   -H "Content-Type: application/json" \
   -d '{
     "question":"What is this document about?",
-    "job_id":"<your_job_id>",
+    "job_ids":["<job_id_a>", "<job_id_b>"],
     "retrieve_k":12,
     "final_k":4,
-    "use_rerank":true
+    "use_rerank":true,
+    "retrieval_mode":"hybrid"
   }'
+```
+
+Session-based target binding (avoid sending `job_id` each call):
+
+```bash
+curl -X POST "http://localhost:8080/v1/rag/session" \
+  -H "Content-Type: application/json" \
+  -d '{"session_id":"demo-session","job_id":"<your_job_id>"}'
+
+curl -X POST "http://localhost:8080/v1/rag/query" \
+  -H "Content-Type: application/json" \
+  -H "X-RAG-Session-Id: demo-session" \
+  -d '{"question":"Summarize key findings."}'
 ```
 
 ## Concurrency and cache controls
@@ -81,6 +100,8 @@ Model and retrieval backends:
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL`
 - `MILVUS_URI`, `MILVUS_TOKEN`, `MILVUS_COLLECTION`
 - `REDIS_URL`
+- `RAG_DEFAULT_JOB_ID` (optional fallback when no explicit `job_id`/`job_ids`/session)
+- `RAG_HYBRID_MAX_CHUNKS` (cap lexical corpus size for API hybrid retrieval)
 
 ## Monitoring stack
 

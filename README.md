@@ -8,6 +8,7 @@ It includes:
 - experiment runners for retrieval and generation quality
 - production API path (`FastAPI + Nginx + Redis cache + Milvus + Ollama`)
 - observability stack (`Prometheus + Grafana`)
+- advanced retrieval options: multi-job querying, hybrid dense+BM25 retrieval, and query expansion (multi-query / HyDE)
 
 ## Start Here
 
@@ -18,6 +19,7 @@ It includes:
 - Experiments and evaluation scripts: [`docs/experiments.md`](docs/experiments.md)
 - Key benchmark snapshots and interpretation: [`docs/results.md`](docs/results.md)
 - Traces, error analysis, and ops notes: [`docs/operations.md`](docs/operations.md)
+- Retrieval expansion references: [`docs/knowledge/advanced-rag-techniques-summary.md`](docs/knowledge/advanced-rag-techniques-summary.md)
 
 ## Minimal Quick Start
 

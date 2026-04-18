@@ -13,10 +13,12 @@ Use this page as the entry point for project documentation.
 ## Production and Serving
 
 - [`api-deployment.md`](api-deployment.md): FastAPI service path (`Ollama + Milvus + Redis + Nginx`) and monitoring
+- Includes multi-job querying (`job_ids`), session-bound default jobs, and dense/hybrid retrieval controls.
 
 ## Additional Notes
 
 - [`gemini-region-restriction.md`](gemini-region-restriction.md): Gemini regional/API restrictions and workaround notes
+- [`knowledge/advanced-rag-techniques-summary.md`](knowledge/advanced-rag-techniques-summary.md): concise retrieval/generation technique notes (query expansion, reranking, hybrid retrieval)
 - [`SESSION_SUMMARY.md`](SESSION_SUMMARY.md): historical session summary notes
 - [`gpuhub-git-push.md`](gpuhub-git-push.md): environment-specific git push notes
 

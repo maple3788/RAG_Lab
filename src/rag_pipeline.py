@@ -9,6 +9,7 @@ from prometheus_client import Histogram
 from src.chunker import chunk_documents, chunks_to_texts
 from src.embedder import (
     EmbeddingModel,
+    prepare_passage,
     prepare_passages,
     prepare_query,
 )
@@ -198,6 +199,43 @@ def retrieve_passages_for_query(
         fusion_list_k=fusion_list_k,
     )
     return final_texts
+
+
+def retrieve_passages_for_hyde_document(
+    hyde_passage: str,
+    question: str,
+    embedder: EmbeddingModel,
+    corpus_chunks: Sequence[str],
+    faiss_index: FaissIndex,
+    *,
+    retrieve_k: int,
+    reranker: Optional[Reranker] = None,
+    final_k: int = 3,
+) -> List[str]:
+    """
+    HyDE: embed ``hyde_passage`` with the same passage preprocessing as indexed chunks, dense
+    search only, then rerank candidates against the real ``question``. Does not combine with
+    hybrid BM25 (use multi-query expansion if you need lexical coverage alongside dense HyDE).
+    """
+    t0 = perf_counter()
+    try:
+        k = min(retrieve_k, len(corpus_chunks))
+        if k <= 0:
+            return []
+        p = prepare_passage(embedder.name, hyde_passage)
+        q_emb = embedder.encode([p])
+        _, idx = search(faiss_index, q_emb, top_k=k)
+        pool = gather_texts_by_indices(corpus_chunks, idx[0].tolist())
+
+        if reranker is not None:
+            final_texts, _ = reranker.rerank(
+                question, pool, top_k=min(final_k, len(pool))
+            )
+        else:
+            final_texts = pool[: min(final_k, len(pool))]
+        return final_texts
+    finally:
+        RAG_RETRIEVAL_SECONDS.observe(perf_counter() - t0)
 
 
 def evaluate_retrieval(

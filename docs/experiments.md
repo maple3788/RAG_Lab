@@ -46,6 +46,14 @@ Main ablations in `exp_rag_generation.py`:
 - final context size (`final_k`)
 - prompt template
 - truncation strategy
+- query expansion mode (`none`, `multi_query`, `hyde`)
+- expansion query count cap (`expansion_max_queries`)
+- rewrite-on-empty fallback (`rewrite_on_empty_retrieval`)
+
+Query expansion notes:
+- `multi_query`: generate several paraphrase queries and merge/dedupe retrieval pools before final rerank.
+- `hyde`: generate a hypothetical passage and retrieve via dense passage embedding (FAISS path).
+- If rewrite-on-empty triggers, retry uses one rewritten query (no second expansion pass).
 
 ## Hybrid retrieval comparison
 

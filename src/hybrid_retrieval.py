@@ -152,3 +152,33 @@ def retrieve_hybrid_pool(
         fusion_list_k=fusion_list_k,
     )
     return gather_texts_by_indices(corpus_chunks, indices)
+
+
+def fuse_milvus_dense_order_with_bm25(
+    question: str,
+    *,
+    corpus_chunks: Sequence[str],
+    dense_global_indices_ordered: List[int],
+    retrieve_k: int,
+    fusion_list_k: int,
+    rrf_k: int = 60,
+) -> List[int]:
+    """
+    RRF fusion for the **Milvus API path**: dense hits are expressed as global chunk indices
+    (best match first); BM25 runs over the same lexical corpus (typically from MinIO).
+
+    Returns up to ``retrieve_k`` global indices after fusion.
+    """
+    n = len(corpus_chunks)
+    if n == 0:
+        return []
+    bm25_resources = build_bm25_resources(corpus_chunks)
+    k_lists = min(int(fusion_list_k), n)
+    k_out = min(int(retrieve_k), n)
+    dense_list = [int(i) for i in dense_global_indices_ordered[:k_lists] if 0 <= int(i) < n]
+    bm25_list = _bm25_ranked_indices(question, bm25_resources, n, top_k=k_lists)
+    return reciprocal_rank_fusion(
+        [dense_list, bm25_list],
+        rrf_k=int(rrf_k),
+        max_results=k_out,
+    )

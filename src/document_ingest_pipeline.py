@@ -82,6 +82,11 @@ def _collection_name_for_config(config: IngestPipelineConfig) -> str:
     return f"rag_chunks_{sig}"
 
 
+def milvus_collection_for_config(config: IngestPipelineConfig) -> str:
+    """Collection name used by Milvus for this ingest config (same URI as ``MILVUS_URI``)."""
+    return _collection_name_for_config(config)
+
+
 def _run_summarization(
     strategy: SummarizationStrategy,
     chunk_texts: List[str],

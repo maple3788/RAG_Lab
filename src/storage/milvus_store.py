@@ -314,6 +314,85 @@ class MilvusChunkStore:
                     "chunk_index": int(ent.get("chunk_index", -1)),
                     "faiss_score": float(h.get("distance", 0.0)),
                     "text": str(ent.get("text", "")),
+                    "job_id": str(ent.get("job_id", job_id)),
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _filter_for_job_ids(job_ids: List[str]) -> str:
+        cleaned = [j.strip() for j in job_ids if j and j.strip()]
+        if not cleaned:
+            raise ValueError("job_ids is empty")
+        for j in cleaned:
+            if '"' in j or "\\" in j:
+                raise ValueError(f"unsupported job_id character in: {j!r}")
+        parts = [f'job_id == "{j}"' for j in cleaned]
+        if len(parts) == 1:
+            return parts[0]
+        return "(" + " || ".join(parts) + ")"
+
+    def search_multi_job_chunks(
+        self,
+        *,
+        job_ids: List[str],
+        query: str,
+        embedder: EmbeddingModel,
+        top_k: int,
+        search_config: Optional[MilvusSearchConfig] = None,
+        index_type: str = "AUTOINDEX",
+        collection_name: Optional[str] = None,
+    ) -> List[dict]:
+        """
+        Vector search restricted to rows whose ``job_id`` is one of ``job_ids`` (same Milvus collection).
+        """
+        if top_k <= 0 or not job_ids:
+            return []
+        if len(job_ids) == 1:
+            return self.search_job_chunks(
+                job_id=job_ids[0].strip(),
+                query=query,
+                embedder=embedder,
+                top_k=top_k,
+                search_config=search_config,
+                index_type=index_type,
+                collection_name=collection_name,
+            )
+        s_cfg = search_config or MilvusSearchConfig()
+        idx_type = (index_type or "AUTOINDEX").upper()
+        target = self._collection_name(collection_name)
+        flt = self._filter_for_job_ids(job_ids)
+        q = prepare_query(embedder.name, query)
+        q_vec = embedder.encode([q])[0].tolist()
+        self._ensure_collection(len(q_vec), metric_type=s_cfg.metric_type, collection_name=target)
+        search_params: dict[str, Any] = {
+            "metric_type": (s_cfg.metric_type or "COSINE").upper(),
+            "params": {},
+        }
+        if idx_type == "IVF_FLAT":
+            search_params["params"] = {"nprobe": int(s_cfg.ivf_nprobe)}
+        elif idx_type == "HNSW":
+            search_params["params"] = {"ef": int(s_cfg.hnsw_ef)}
+        out = self._client.search(
+            collection_name=target,
+            data=[q_vec],
+            filter=flt,
+            limit=int(top_k),
+            output_fields=["job_id", "chunk_index", "text"],
+            search_params=search_params,
+        )
+        hits = out[0] if out else []
+        rows: List[dict] = []
+        for i, h in enumerate(hits, start=1):
+            ent = h.get("entity", {})
+            rows.append(
+                {
+                    "query_used": query,
+                    "faiss_rank": i,
+                    "chunk_index": int(ent.get("chunk_index", -1)),
+                    "faiss_score": float(h.get("distance", 0.0)),
+                    "text": str(ent.get("text", "")),
+                    "job_id": str(ent.get("job_id", "")),
                 }
             )
         return rows

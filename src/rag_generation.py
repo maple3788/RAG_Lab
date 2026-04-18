@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from time import perf_counter
 from traceback import format_exc
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -18,10 +18,11 @@ from src.embedder import EmbeddingModel, prepare_query
 from src.generator import TextGenerator
 from src.loader import QAExample
 from src.prompts import format_rag_prompt
-from src.hybrid_retrieval import build_bm25_resources
+from src.hybrid_retrieval import BM25Resources, build_bm25_resources
 from src.rag_pipeline import (
     build_corpus_chunks_from_documents,
     build_retrieval_index,
+    retrieve_passages_for_hyde_document,
     retrieve_passages_for_query,
 )
 from src.reranker import Reranker
@@ -58,6 +59,12 @@ class RAGGenerationConfig:
     semantic_cache_max_entries: int = 512
     #: Optional fallback: rewrite query once if no passages were retrieved.
     rewrite_on_empty_retrieval: bool = False
+    #: ``multi_query``: LLM paraphrases / sub-queries, merge + dedupe then rerank on original
+    #: question. ``hyde``: hypothetical passage, dense retrieval via passage embedding only
+    #: (BM25 hybrid is not fused with HyDE). ``none``: single query string.
+    query_expansion: Literal["none", "multi_query", "hyde"] = "none"
+    #: Max queries including the original (``multi_query`` only).
+    expansion_max_queries: int = 4
     #: If true, record per-example failures and continue evaluation instead of raising.
     continue_on_error: bool = True
 
@@ -81,6 +88,149 @@ def _rewrite_query(generator: TextGenerator, question: str) -> str:
     return rewritten if rewritten else question
 
 
+def _multi_query_variants(
+    generator: TextGenerator,
+    question: str,
+    *,
+    max_queries: int,
+) -> List[str]:
+    max_queries = max(1, max_queries)
+    prompt = (
+        "For passage retrieval, list short search queries that could find relevant text. "
+        "Use paraphrases, synonyms, and alternative keyword phrasings. "
+        "One query per line; no numbering, bullets, or explanation.\n\n"
+        f"Question:\n{question}\n"
+    )
+    raw = generator.generate(prompt).strip()
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    out: List[str] = [question]
+    lower_seen = {question.lower()}
+    for ln in lines:
+        if len(out) >= max_queries:
+            break
+        low = ln.lower()
+        if low not in lower_seen:
+            lower_seen.add(low)
+            out.append(ln)
+    return out
+
+
+def _hyde_hypothetical_passage(generator: TextGenerator, question: str) -> str:
+    prompt = (
+        "Write a short hypothetical passage (2-4 sentences) that could appear in a document "
+        "and would help answer the question. Use concrete terms and entities when possible. "
+        "Do not explain the task.\n\n"
+        f"Question: {question}\n\nPassage:"
+    )
+    text = generator.generate(prompt).strip()
+    return text if text else question
+
+
+def _retrieve_merged_multi_query(
+    queries: Sequence[str],
+    original_question: str,
+    embedder: EmbeddingModel,
+    corpus_chunks: Sequence[str],
+    faiss_index: FaissIndex,
+    *,
+    retrieve_k: int,
+    reranker: Optional[Reranker],
+    final_k: int,
+    bm25_resources: Optional[BM25Resources],
+    rrf_k: int,
+    fusion_list_k: Optional[int],
+) -> List[str]:
+    """Per-variant retrieval without rerank; dedupe by full passage text; one rerank on merged pool."""
+    seen: set[str] = set()
+    pool: List[str] = []
+    cap = max(retrieve_k * 4, final_k * 4, 32)
+    for q in queries:
+        if len(pool) >= cap:
+            break
+        part = retrieve_passages_for_query(
+            q,
+            embedder,
+            corpus_chunks,
+            faiss_index,
+            retrieve_k=retrieve_k,
+            reranker=None,
+            final_k=retrieve_k,
+            bm25_resources=bm25_resources,
+            rrf_k=rrf_k,
+            fusion_list_k=fusion_list_k,
+        )
+        for t in part:
+            if t not in seen:
+                seen.add(t)
+                pool.append(t)
+    pool = pool[:cap]
+    if reranker is not None:
+        texts, _ = reranker.rerank(
+            original_question, pool, top_k=min(final_k, len(pool))
+        )
+        return list(texts)
+    return pool[: min(final_k, len(pool))]
+
+
+def _run_retrieval_for_question(
+    question: str,
+    *,
+    force_plain: bool,
+    generator: TextGenerator,
+    config: RAGGenerationConfig,
+    embedder: EmbeddingModel,
+    corpus_chunks: Sequence[str],
+    faiss_index: FaissIndex,
+    reranker: Optional[Reranker],
+    bm25_resources: Optional[BM25Resources],
+    fusion_list_k: Optional[int],
+) -> List[str]:
+    rr = reranker if config.use_rerank else None
+    if force_plain or config.query_expansion == "none":
+        return retrieve_passages_for_query(
+            question,
+            embedder,
+            corpus_chunks,
+            faiss_index,
+            retrieve_k=config.retrieve_k,
+            reranker=rr,
+            final_k=config.final_k,
+            bm25_resources=bm25_resources,
+            rrf_k=config.rrf_k,
+            fusion_list_k=fusion_list_k,
+        )
+    if config.query_expansion == "multi_query":
+        variants = _multi_query_variants(
+            generator,
+            question,
+            max_queries=config.expansion_max_queries,
+        )
+        return _retrieve_merged_multi_query(
+            variants,
+            question,
+            embedder,
+            corpus_chunks,
+            faiss_index,
+            retrieve_k=config.retrieve_k,
+            reranker=rr,
+            final_k=config.final_k,
+            bm25_resources=bm25_resources,
+            rrf_k=config.rrf_k,
+            fusion_list_k=fusion_list_k,
+        )
+    hyde = _hyde_hypothetical_passage(generator, question)
+    return retrieve_passages_for_hyde_document(
+        hyde,
+        question,
+        embedder,
+        corpus_chunks,
+        faiss_index,
+        retrieve_k=config.retrieve_k,
+        reranker=rr,
+        final_k=config.final_k,
+    )
+
+
 def evaluate_rag_answer_quality(
     examples: Sequence[QAExample],
     *,
@@ -95,6 +245,11 @@ def evaluate_rag_answer_quality(
     """
     End-to-end: retrieve → build prompt → generate → EM / F1 / gold hit (mean over examples).
     Pass ``faiss_index`` to reuse the same index across runs (large corpora).
+
+    Optional ``config.query_expansion``: ``multi_query`` (LLM paraphrases, merged retrieval),
+    ``hyde`` (hypothetical document embedding; dense only), or ``none``. If
+    ``rewrite_on_empty_retrieval`` fires, the retry uses a single rewritten query without
+    expansion to limit extra LLM calls.
     """
     if not config.per_example_retrieval and faiss_index is None:
         faiss_index = build_retrieval_index(embedder, corpus_chunks)
@@ -203,18 +358,21 @@ def evaluate_rag_answer_quality(
                 if bm25 is not None and fusion is None:
                     fusion = len(chunks)
                 t0_retrieve = perf_counter()
-                passages = [] if cached_prediction is not None else retrieve_passages_for_query(
-                    ex.question,
-                    embedder,
-                    chunks,
-                    fi,
-                    retrieve_k=config.retrieve_k,
-                    reranker=reranker if config.use_rerank else None,
-                    final_k=config.final_k,
-                    bm25_resources=bm25,
-                    rrf_k=config.rrf_k,
-                    fusion_list_k=fusion,
-                )
+                if cached_prediction is not None:
+                    passages = []
+                else:
+                    passages = _run_retrieval_for_question(
+                        ex.question,
+                        force_plain=False,
+                        generator=generator,
+                        config=config,
+                        embedder=embedder,
+                        corpus_chunks=chunks,
+                        faiss_index=fi,
+                        reranker=reranker,
+                        bm25_resources=bm25,
+                        fusion_list_k=fusion,
+                    )
                 if (
                     cached_prediction is None
                     and config.rewrite_on_empty_retrieval
@@ -223,16 +381,16 @@ def evaluate_rag_answer_quality(
                     t0_rewrite = perf_counter()
                     rewritten = _rewrite_query(generator, ex.question)
                     rewrite_ms = (perf_counter() - t0_rewrite) * 1000.0
-                    passages = retrieve_passages_for_query(
+                    passages = _run_retrieval_for_question(
                         rewritten,
-                        embedder,
-                        chunks,
-                        fi,
-                        retrieve_k=config.retrieve_k,
-                        reranker=reranker if config.use_rerank else None,
-                        final_k=config.final_k,
+                        force_plain=True,
+                        generator=generator,
+                        config=config,
+                        embedder=embedder,
+                        corpus_chunks=chunks,
+                        faiss_index=fi,
+                        reranker=reranker,
                         bm25_resources=bm25,
-                        rrf_k=config.rrf_k,
                         fusion_list_k=fusion,
                     )
                 retrieve_ms = (perf_counter() - t0_retrieve) * 1000.0
@@ -240,15 +398,21 @@ def evaluate_rag_answer_quality(
                 lat_rewrite_ms.append(rewrite_ms)
             else:
                 t0_retrieve = perf_counter()
-                passages = [] if cached_prediction is not None else retrieve_passages_for_query(
-                    ex.question,
-                    embedder,
-                    corpus_chunks,
-                    faiss_index,  # type: ignore[arg-type]
-                    retrieve_k=config.retrieve_k,
-                    reranker=reranker if config.use_rerank else None,
-                    final_k=config.final_k,
-                )
+                if cached_prediction is not None:
+                    passages = []
+                else:
+                    passages = _run_retrieval_for_question(
+                        ex.question,
+                        force_plain=False,
+                        generator=generator,
+                        config=config,
+                        embedder=embedder,
+                        corpus_chunks=corpus_chunks,
+                        faiss_index=faiss_index,  # type: ignore[arg-type]
+                        reranker=reranker,
+                        bm25_resources=None,
+                        fusion_list_k=None,
+                    )
                 if (
                     cached_prediction is None
                     and config.rewrite_on_empty_retrieval
@@ -257,14 +421,17 @@ def evaluate_rag_answer_quality(
                     t0_rewrite = perf_counter()
                     rewritten = _rewrite_query(generator, ex.question)
                     rewrite_ms = (perf_counter() - t0_rewrite) * 1000.0
-                    passages = retrieve_passages_for_query(
+                    passages = _run_retrieval_for_question(
                         rewritten,
-                        embedder,
-                        corpus_chunks,
-                        faiss_index,  # type: ignore[arg-type]
-                        retrieve_k=config.retrieve_k,
-                        reranker=reranker if config.use_rerank else None,
-                        final_k=config.final_k,
+                        force_plain=True,
+                        generator=generator,
+                        config=config,
+                        embedder=embedder,
+                        corpus_chunks=corpus_chunks,
+                        faiss_index=faiss_index,  # type: ignore[arg-type]
+                        reranker=reranker,
+                        bm25_resources=None,
+                        fusion_list_k=None,
                     )
                 retrieve_ms = (perf_counter() - t0_retrieve) * 1000.0
                 lat_retrieve_ms.append(retrieve_ms)

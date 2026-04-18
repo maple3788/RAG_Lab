@@ -18,7 +18,7 @@ import time
 import warnings
 from time import perf_counter
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 # Quiet Python warnings (deprecations, ragas, torch, etc.) in the Streamlit terminal.
 warnings.simplefilter("ignore")
@@ -209,6 +209,73 @@ def ingest_summarizer(backend: str):
         return gen.generate(text)
 
     return _fn
+
+
+def _retrieval_merge_key(row: dict) -> Union[int, Tuple[str, str, int]]:
+    """Deduplicate merged hits: chunk_index alone collides across different Milvus jobs."""
+    jid = row.get("job_id")
+    if jid is not None and str(jid).strip() != "":
+        return ("jid", str(jid).strip(), int(row["chunk_index"]))
+    return int(row["chunk_index"])
+
+
+def _apply_multi_doc_prefixes(passages: List[str], retrieved_rows: List[dict]) -> List[str]:
+    """Prefix passages when chunks come from more than one ingest job."""
+    tj = {str(r["text"]): r.get("job_id") for r in retrieved_rows if r.get("text")}
+    jobs = {tj.get(p) for p in passages if tj.get(p)}
+    jobs.discard(None)
+    if len(jobs) <= 1:
+        return passages
+    out: List[str] = []
+    for p in passages:
+        jid = tj.get(p)
+        out.append(f"[doc:{jid}] {p}" if jid else p)
+    return out
+
+
+def _milvus_search_multi_jobs(
+    job_ids: List[str],
+    query: str,
+    embedder: EmbeddingModel,
+    milvus_store: MilvusChunkStore,
+    top_k: int,
+    index_type_default: str,
+    search_config: MilvusSearchConfig,
+) -> List[dict]:
+    """Search across multiple jobs (possibly multiple Milvus collections)."""
+    minio = MinioArtifactStore()
+    groups: Dict[str, List[str]] = {}
+    metas: Dict[str, Dict[str, Any]] = {}
+    for jid in job_ids:
+        j = jid.strip()
+        meta = minio.get_job_metadata(j) or {}
+        coll = str(meta.get("milvus_collection") or "").strip() or None
+        if not coll:
+            raise ValueError(f"missing milvus_collection in MinIO metadata for job_id={j}")
+        groups.setdefault(coll, []).append(j)
+        metas[j] = meta
+    all_rows: List[dict] = []
+    for coll, jids_in in groups.items():
+        m0 = metas.get(jids_in[0], {})
+        idx_t = (index_type_default or "").strip() or str(m0.get("milvus_index_type", "AUTOINDEX"))
+        mtype = str(m0.get("milvus_metric_type", "COSINE") or "COSINE")
+        sc = MilvusSearchConfig(
+            metric_type=mtype,
+            ivf_nprobe=int(search_config.ivf_nprobe),
+            hnsw_ef=int(search_config.hnsw_ef),
+        )
+        part = milvus_store.search_multi_job_chunks(
+            job_ids=jids_in,
+            query=query,
+            embedder=embedder,
+            top_k=top_k,
+            index_type=str(idx_t or "AUTOINDEX").strip(),
+            search_config=sc,
+            collection_name=coll,
+        )
+        all_rows.extend(part)
+    all_rows.sort(key=lambda r: float(r.get("faiss_score", 0.0)))
+    return all_rows[:top_k]
 
 
 def cross_encoder_rerank_trace(
@@ -675,6 +742,7 @@ def _retrieve_rows_for_query(
     vdb_backend: str = "faiss",
     milvus_store: Optional[MilvusChunkStore] = None,
     milvus_job_id: Optional[str] = None,
+    milvus_job_ids: Optional[List[str]] = None,
     milvus_collection: Optional[str] = None,
     milvus_index_type: str = "AUTOINDEX",
     milvus_search_config: Optional[MilvusSearchConfig] = None,
@@ -683,6 +751,22 @@ def _retrieve_rows_for_query(
     fusion_list_k: Optional[int] = None,
     rrf_k: int = 60,
 ) -> List[dict]:
+    mids = [x.strip() for x in (milvus_job_ids or []) if x and str(x).strip()]
+    if (
+        vdb_backend == "milvus"
+        and milvus_store is not None
+        and len(mids) > 1
+        and milvus_search_config is not None
+    ):
+        return _milvus_search_multi_jobs(
+            mids,
+            query,
+            embedder,
+            milvus_store,
+            top_k,
+            milvus_index_type,
+            milvus_search_config,
+        )
     if (
         vdb_backend == "milvus"
         and milvus_store is not None
@@ -773,6 +857,7 @@ def run_pipeline(
     vdb_backend: str = "faiss",
     milvus_store: Optional[MilvusChunkStore] = None,
     milvus_job_id: Optional[str] = None,
+    milvus_job_ids: Optional[List[str]] = None,
     milvus_collection: Optional[str] = None,
     milvus_index_type: str = "AUTOINDEX",
     milvus_search_config: Optional[MilvusSearchConfig] = None,
@@ -784,7 +869,19 @@ def run_pipeline(
     fusion_list_k: Optional[int] = None,
     rrf_k: int = 60,
 ) -> dict:
-    k = min(retrieve_k, len(corpus_chunks))
+    mids = [x.strip() for x in (milvus_job_ids or []) if x and str(x).strip()]
+    if not mids and milvus_job_id and str(milvus_job_id).strip():
+        mids = [str(milvus_job_id).strip()]
+    use_milvus_vec = bool(
+        vdb_backend == "milvus"
+        and milvus_store is not None
+        and len(mids) >= 1
+        and milvus_search_config is not None
+    )
+    if use_milvus_vec:
+        k = retrieve_k
+    else:
+        k = min(retrieve_k, len(corpus_chunks))
     llm_details = get_generator_details(generator)
     stage_trace: List[dict] = []
     stage_trace.append(
@@ -807,6 +904,7 @@ def run_pipeline(
                 "retrieval_mode": retrieval_mode,
                 "milvus_index_type": milvus_index_type,
                 "milvus_collection": milvus_collection,
+                "milvus_job_ids": mids if len(mids) > 1 else None,
             },
         }
     )
@@ -900,7 +998,9 @@ def run_pipeline(
     )
 
     t_stage = perf_counter()
-    merged: Dict[int, dict] = {}
+    merged: Dict[Any, dict] = {}
+    _pass_milvus_ids = mids if len(mids) > 1 else None
+    _pass_milvus_job = mids[0] if len(mids) == 1 else milvus_job_id
     for rq in retrieval_queries:
         rows = _retrieve_rows_for_query(
             rq,
@@ -910,7 +1010,8 @@ def run_pipeline(
             top_k=k,
             vdb_backend=vdb_backend,
             milvus_store=milvus_store,
-            milvus_job_id=milvus_job_id,
+            milvus_job_id=_pass_milvus_job,
+            milvus_job_ids=_pass_milvus_ids,
             milvus_collection=milvus_collection,
             milvus_index_type=milvus_index_type,
             milvus_search_config=milvus_search_config,
@@ -920,17 +1021,19 @@ def run_pipeline(
             rrf_k=rrf_k,
         )
         for row in rows:
+            mk = _retrieval_merge_key(row)
             ci = int(row["chunk_index"])
-            if ci not in merged:
-                merged[ci] = {
+            if mk not in merged:
+                merged[mk] = {
                     "chunk_index": ci,
                     "faiss_score": float(row["faiss_score"]),
                     "best_faiss_rank": int(row["faiss_rank"]),
                     "matched_queries": [rq],
                     "text": row["text"],
+                    "job_id": row.get("job_id"),
                 }
             else:
-                cur = merged[ci]
+                cur = merged[mk]
                 cur["faiss_score"] = max(float(cur["faiss_score"]), float(row["faiss_score"]))
                 cur["best_faiss_rank"] = min(int(cur["best_faiss_rank"]), int(row["faiss_rank"]))
                 if rq not in cur["matched_queries"]:
@@ -1074,7 +1177,9 @@ def run_pipeline(
         on_stream: Optional[Callable[[str], None]] = None,
         on_raw_stream: Optional[Callable[[str], None]] = None,
     ) -> tuple[str, str, str, str]:
-        raw_ctx, user_prompt, prompt_val = _compose_rag_prompt_parts(passages, q_for_prompt)
+        raw_ctx, user_prompt, prompt_val = _compose_rag_prompt_parts(
+            _apply_multi_doc_prefixes(passages, retrieved), q_for_prompt
+        )
         answer_val = generate_visible_answer(
             generator=generator,
             system_prompt=RAG_SYSTEM_PROMPT,
@@ -1087,7 +1192,7 @@ def run_pipeline(
 
     t_stage = perf_counter()
     raw_context, user_prompt, prompt = _compose_rag_prompt_parts(
-        final_passages, rewritten_question
+        _apply_multi_doc_prefixes(final_passages, retrieved), rewritten_question
     )
     stage_latencies["prompt_build_ms"] = (perf_counter() - t_stage) * 1000.0
 
@@ -1176,7 +1281,8 @@ def run_pipeline(
                 top_k=k,
                 vdb_backend=vdb_backend,
                 milvus_store=milvus_store,
-                milvus_job_id=milvus_job_id,
+                milvus_job_id=_pass_milvus_job,
+                milvus_job_ids=_pass_milvus_ids,
                 milvus_collection=milvus_collection,
                 milvus_index_type=milvus_index_type,
                 milvus_search_config=milvus_search_config,
@@ -1187,18 +1293,20 @@ def run_pipeline(
             )
             added = 0
             for row in new_rows:
+                mk = _retrieval_merge_key(row)
                 ci = int(row["chunk_index"])
-                if ci not in merged:
-                    merged[ci] = {
+                if mk not in merged:
+                    merged[mk] = {
                         "chunk_index": ci,
                         "faiss_score": float(row["faiss_score"]),
                         "best_faiss_rank": int(row["faiss_rank"]),
                         "matched_queries": [followup],
                         "text": row["text"],
+                        "job_id": row.get("job_id"),
                     }
                     added += 1
                 else:
-                    cur = merged[ci]
+                    cur = merged[mk]
                     cur["faiss_score"] = max(
                         float(cur["faiss_score"]), float(row["faiss_score"])
                     )
@@ -1386,8 +1494,10 @@ def render_rag_trace(result: dict, *, ui_id: int, final_k: int) -> None:
             )
         st.markdown("Top-K from bi-encoder vector search (cosine-style similarity).")
         for row in result["retrieved"]:
+            _jid = row.get("job_id")
+            _jl = f" · job `{_jid[:10]}…`" if _jid else ""
             with st.expander(
-                f"Rank {row['faiss_rank']} · chunk #{row['chunk_index']} · {row['faiss_score']:.4f}"
+                f"Rank {row['faiss_rank']} · chunk #{row['chunk_index']}{_jl} · {row['faiss_score']:.4f}"
             ):
                 mqs = row.get("matched_queries")
                 if isinstance(mqs, list) and mqs:
@@ -2000,6 +2110,7 @@ def unload_index() -> None:
     st.session_state.source_label = None
     st.session_state.ingest_meta = {}
     st.session_state.loaded_job_id = None
+    st.session_state.loaded_job_ids = []
     st.session_state.loaded_milvus_collection = None
     st.session_state.pop("last_rag", None)
     st.session_state.pop("last_question", None)
@@ -2015,6 +2126,7 @@ def load_job(job_id: str) -> None:
     fn = meta.get("filename") or "document"
     st.session_state.source_label = f"{job_id.strip()} · {fn}"
     st.session_state.loaded_job_id = job_id.strip()
+    st.session_state.loaded_job_ids = [job_id.strip()]
     st.session_state.loaded_milvus_collection = str(meta.get("milvus_collection") or "").strip() or None
     st.session_state.last_job_id = job_id.strip()
     st.session_state.pop("last_rag", None)
@@ -2030,6 +2142,44 @@ def load_job(job_id: str) -> None:
             raise RuntimeError(f"Milvus collection load failed: {load_res}")
 
 
+def load_jobs_multi(job_ids: List[str]) -> None:
+    """Load several ingest jobs so retrieval can query across Milvus with multiple job_id filters."""
+    ids = [j.strip() for j in job_ids if j and j.strip()]
+    if not ids:
+        raise ValueError("no job ids")
+    if len(ids) > 32:
+        raise ValueError("at most 32 jobs")
+    all_chunks: List[str] = []
+    metas: List[dict[str, Any]] = []
+    cols_seen: set[str] = set()
+    for jid in ids:
+        chunks, meta = load_ingest_from_minio(jid)
+        all_chunks.extend(chunks)
+        metas.append(meta)
+        coll = str(meta.get("milvus_collection") or "").strip()
+        if coll and coll not in cols_seen:
+            load_res = _milvus_store().load_collection(
+                collection_name=coll,
+                release_others=False,
+            )
+            if not load_res.get("loaded") and load_res.get("exists", True):
+                raise RuntimeError(f"Milvus collection load failed: {load_res}")
+            cols_seen.add(coll)
+    st.session_state.corpus_chunks = all_chunks
+    st.session_state.faiss_index = None
+    st.session_state.ingest_meta = metas[0] if metas else {}
+    st.session_state.loaded_job_ids = ids
+    st.session_state.loaded_job_id = ids[0]
+    st.session_state.loaded_milvus_collection = None
+    short = [f"{j[:8]}…" if len(j) > 12 else j for j in ids]
+    st.session_state.source_label = f"{len(ids)} jobs · " + ", ".join(short)
+    st.session_state.last_job_id = ids[-1]
+    st.session_state.pop("last_rag", None)
+    st.session_state.pop("last_question", None)
+    st.session_state.query_history = []
+    st.session_state.qa_messages = []
+
+
 def _init_session() -> None:
     if "corpus_chunks" not in st.session_state:
         st.session_state.corpus_chunks = []
@@ -2043,6 +2193,8 @@ def _init_session() -> None:
         st.session_state.last_job_id = ""
     if "loaded_job_id" not in st.session_state:
         st.session_state.loaded_job_id = None
+    if "loaded_job_ids" not in st.session_state:
+        st.session_state.loaded_job_ids = []
     if "loaded_milvus_collection" not in st.session_state:
         st.session_state.loaded_milvus_collection = None
     if "nav" not in st.session_state:
@@ -2147,7 +2299,10 @@ def _ui_ingest_pipeline() -> None:
             type=["pdf", "txt", "md"],
             key="ing_upl",
             accept_multiple_files=True,
-            help="Upload one or more documents; each file becomes a separate ingest job.",
+            help=(
+                "Upload one or more documents; **each file is a separate ingest job** (its own job_id). "
+                "To query several together, use Query → select multiple jobs → Load."
+            ),
         )
     with filt_col:
         page_spec = st.text_input(
@@ -2427,7 +2582,10 @@ def _job_label_for_select(row: dict[str, Any]) -> str:
 
 
 def _ui_query() -> None:
-    st.caption("Attach an ingest job from MinIO, then ask questions. Retrieval is Milvus-only.")
+    st.caption(
+        "Attach one or more ingest jobs from MinIO, then ask questions. "
+        "Multi-select + **Load** queries across all selected docs (Milvus). Retrieval is Milvus-only."
+    )
 
     try:
         jobs = _minio_store().list_ingest_jobs_table()
@@ -2436,13 +2594,23 @@ def _ui_query() -> None:
         return
 
     st.subheader("Loaded job context")
+    _lj = st.session_state.get("loaded_job_ids") or []
+    if not _lj and st.session_state.get("loaded_job_id"):
+        _lj = [st.session_state.loaded_job_id]
     if st.session_state.loaded_job_id and len(st.session_state.corpus_chunks) > 0:
-        st.success(
-            f"Loaded **{st.session_state.loaded_job_id}** — "
-            f"{len(st.session_state.corpus_chunks)} chunks · {st.session_state.source_label}"
-        )
-        if st.session_state.get("loaded_milvus_collection"):
-            st.caption(f"Milvus collection loaded: `{st.session_state.loaded_milvus_collection}`")
+        if len(_lj) > 1:
+            st.success(
+                f"Loaded **{len(_lj)} jobs** — {len(st.session_state.corpus_chunks)} chunks total · "
+                f"{st.session_state.source_label}"
+            )
+            st.caption("Queries use **combined Milvus retrieval** across the selected jobs.")
+        else:
+            st.success(
+                f"Loaded **{st.session_state.loaded_job_id}** — "
+                f"{len(st.session_state.corpus_chunks)} chunks · {st.session_state.source_label}"
+            )
+            if st.session_state.get("loaded_milvus_collection"):
+                st.caption(f"Milvus collection loaded: `{st.session_state.loaded_milvus_collection}`")
     else:
         st.warning("No job loaded.")
 
@@ -2458,28 +2626,35 @@ def _ui_query() -> None:
 
     if not options:
         st.info("No jobs in MinIO yet — use **Ingest** first.")
-        selected = None
+        selected: List[str] = []
     else:
-        default_ix = 0
-        lid = st.session_state.get("loaded_job_id")
-        if lid and lid in options:
-            default_ix = options.index(lid)
-        selected = st.selectbox(
-            "Job",
+        default_sel: List[str] = []
+        prev_multi = st.session_state.get("loaded_job_ids") or []
+        if prev_multi and isinstance(prev_multi, list):
+            default_sel = [x for x in prev_multi if x in options]
+        elif st.session_state.get("loaded_job_id") in options:
+            default_sel = [st.session_state.loaded_job_id]
+        selected = st.multiselect(
+            "Job(s)",
             options=options,
-            index=default_ix,
+            default=default_sel,
             format_func=lambda jid: label_by_id.get(jid, jid),
-            help="Choose which ingest job to load for querying.",
+            help="Select one job, or multiple jobs to query across all of them (Milvus).",
+            max_selections=32,
         )
 
     if st.button("Load", type="primary"):
         if attach:
             if not selected:
-                st.error("No job to load.")
+                st.error("Select at least one job to load.")
             else:
                 try:
-                    load_job(selected)
-                    st.success(f"Loaded `{selected}`")
+                    if len(selected) == 1:
+                        load_job(selected[0])
+                        st.success(f"Loaded `{selected[0]}`")
+                    else:
+                        load_jobs_multi(selected)
+                        st.success(f"Loaded {len(selected)} jobs for multi-doc query.")
                     st.rerun()
                 except Exception as e:
                     st.exception(e)
@@ -2801,13 +2976,18 @@ def _ui_query() -> None:
             )
             return
         semantic_cache = None
-        if use_semantic_cache:
+        _loaded_ids = st.session_state.get("loaded_job_ids") or []
+        if not _loaded_ids and st.session_state.get("loaded_job_id"):
+            _loaded_ids = [st.session_state.loaded_job_id]
+        if use_semantic_cache and len(_loaded_ids) <= 1:
             try:
                 ns = st.session_state.loaded_job_id or "default"
                 semantic_cache = RedisSemanticCache(namespace=ns)
             except Exception as e:
                 st.warning(f"Redis semantic cache disabled: {e}")
                 semantic_cache = None
+        elif use_semantic_cache and len(_loaded_ids) > 1:
+            st.caption("Semantic cache off when multiple jobs are loaded.")
         hist = (
             _history_to_text(st.session_state.get("query_history", []), max_turns=int(history_turns))
             if use_session_history
@@ -2844,7 +3024,10 @@ def _ui_query() -> None:
                 vdb_backend=vdb_backend,
                 milvus_store=milvus_store,
                 milvus_job_id=st.session_state.loaded_job_id,
-                milvus_collection=st.session_state.get("loaded_milvus_collection"),
+                milvus_job_ids=(_loaded_ids if len(_loaded_ids) > 1 else None),
+                milvus_collection=(
+                    None if len(_loaded_ids) > 1 else st.session_state.get("loaded_milvus_collection")
+                ),
                 milvus_index_type=str(milvus_index_type),
                 milvus_search_config=milvus_search_config,
                 semantic_cache=semantic_cache,
