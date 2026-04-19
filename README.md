@@ -47,6 +47,15 @@ docker compose up -d
 rag-lab
 ├── demo/app.py
 ├── src/
+│   ├── api/           # FastAPI service
+│   ├── config/        # Pydantic + YAML pipeline config
+│   ├── datasets/      # QA / BEIR / Hugging Face loaders
+│   ├── eval/          # metrics, RAGAS UI, experiment tracking
+│   ├── ingestion/     # extract, chunk, ingest pipeline
+│   ├── llm/           # embedder, reranker, generators, prompts
+│   ├── rag/           # retrieval + generation orchestration
+│   ├── retrieval/     # FAISS/Milvus, hybrid, metadata filters
+│   └── storage/       # MinIO, Redis, Milvus clients
 ├── experiments/
 ├── docs/
 ├── tools/

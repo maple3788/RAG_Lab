@@ -62,8 +62,11 @@ from dotenv import load_dotenv
 
 load_dotenv(ROOT / ".env")
 
-from src.context_truncation import TruncationStrategy, truncate_context
-from src.document_ingest_pipeline import load_ingest_from_minio, run_document_ingest
+from src.rag.context_truncation import TruncationStrategy, truncate_context
+from src.ingestion.document_ingest_pipeline import (
+    load_ingest_from_minio,
+    run_document_ingest,
+)
 from src.config import (
     MetadataFilterConfig,
     MilvusRuntimeConfig,
@@ -75,9 +78,9 @@ from src.config import (
     load_ingest_config,
     merge_ingest_with_dict,
 )
-from src.milvus_metadata import metadata_filter_to_milvus_expr
-from src.embedder import EmbeddingModel, load_embedding_model, prepare_query
-from src.generator import (
+from src.retrieval.milvus_metadata import metadata_filter_to_milvus_expr
+from src.llm.embedder import EmbeddingModel, load_embedding_model, prepare_query
+from src.llm.generator import (
     ChatTextGenerator,
     GeminiGenerator,
     MockGenerator,
@@ -87,11 +90,15 @@ from src.generator import (
     StreamingTextGenerator,
     TextGenerator,
 )
-from src.prompts import PROMPT_TEMPLATES, format_rag_prompt
-from src.rag_generation import passages_to_context
-from src.hybrid_retrieval import BM25Resources, build_bm25_resources, fused_top_indices
-from src.reranker import Reranker, load_reranker
-from src.retriever import FaissIndex, search
+from src.llm.prompts import PROMPT_TEMPLATES, format_rag_prompt
+from src.rag.rag_generation import passages_to_context
+from src.retrieval.hybrid_retrieval import (
+    BM25Resources,
+    build_bm25_resources,
+    fused_top_indices,
+)
+from src.llm.reranker import Reranker, load_reranker
+from src.retrieval.retriever import FaissIndex, search
 from src.storage.minio_artifacts import MinioArtifactStore, load_minio_settings
 from src.storage.milvus_store import (
     MilvusChunkStore,
@@ -99,13 +106,16 @@ from src.storage.milvus_store import (
 )
 from src.storage.redis_jobs import RedisJobStore
 from src.storage.redis_semantic_cache import RedisSemanticCache
-from src.streaming_parser import (
+from src.ingestion.streaming_parser import (
     HiddenReasoningStreamParser,
     strip_hidden_reasoning_text,
 )
-from src.ragas_ui_metrics import run_ragas_legacy_evaluate
-from src.rag_pipeline import record_rag_generation_latency, record_rag_retrieval_latency
-from src.experiment_tracking import (
+from src.eval.ragas_ui_metrics import run_ragas_legacy_evaluate
+from src.rag.rag_pipeline import (
+    record_rag_generation_latency,
+    record_rag_retrieval_latency,
+)
+from src.eval.experiment_tracking import (
     FAILURE_FEEDBACK_LABELS,
     aggregate_token_totals,
     fetch_queries_dataframe,
@@ -115,7 +125,7 @@ from src.experiment_tracking import (
     log_query_event,
     update_query_feedback,
 )
-from src.metrics import (
+from src.eval.metrics import (
     approx_token_count,
     composite_ragas_score,
     compute_answer_metrics,

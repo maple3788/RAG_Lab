@@ -28,15 +28,15 @@ sys.path.insert(0, str(ROOT))
 
 import numpy as np
 
-from src.embedder import load_embedding_model, prepare_query
-from src.hybrid_retrieval import (
+from src.llm.embedder import load_embedding_model, prepare_query
+from src.retrieval.hybrid_retrieval import (
     BM25Resources,
     build_bm25_resources,
     fused_top_indices,
     tokenize_for_bm25,
 )
-from src.rag_pipeline import build_retrieval_index
-from src.retriever import search
+from src.rag.rag_pipeline import build_retrieval_index
+from src.retrieval.retriever import search
 
 
 GOLD_SUBSTRING = "85.99"

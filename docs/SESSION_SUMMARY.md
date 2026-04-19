@@ -43,8 +43,8 @@ Canonical tables: **`README.md` → Results (TREC-COVID, BEIR)**.
 | Path | Role |
 |------|------|
 | `experiments/exp_trec_covid.py` | Main TREC script, ablations, cache wiring |
-| `src/faiss_cache.py` | Disk cache for indices |
-| `src/beir_io.py` | BEIR loaders |
+| `src/retrieval/faiss_cache.py` | Disk cache for indices |
+| `src/datasets/beir_io.py` | BEIR loaders |
 | `results/trec_covid_compare_*.csv` | TREC CSV outputs |
 
 ---

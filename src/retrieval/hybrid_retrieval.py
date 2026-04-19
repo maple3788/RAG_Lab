@@ -13,8 +13,8 @@ from typing import List, Sequence
 import numpy as np
 from rank_bm25 import BM25Okapi
 
-from src.embedder import EmbeddingModel, prepare_query
-from src.retriever import FaissIndex, gather_texts_by_indices, search
+from src.llm.embedder import EmbeddingModel, prepare_query
+from src.retrieval.retriever import FaissIndex, gather_texts_by_indices, search
 
 
 def tokenize_for_bm25(text: str) -> List[str]:

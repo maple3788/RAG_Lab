@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Sequence
 
-from src.loader import QAExample
+from src.datasets.loader import QAExample
 
 
 def _contexts_from_trivia_row(row: Dict[str, Any]) -> List[str]:

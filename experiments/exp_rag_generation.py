@@ -11,19 +11,19 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.context_truncation import TruncationStrategy
-from src.embedder import load_embedding_model
-from src.generator import (
+from src.rag.context_truncation import TruncationStrategy
+from src.llm.embedder import load_embedding_model
+from src.llm.generator import (
     GeminiGenerator,
     MockGenerator,
     OllamaGenerator,
     OpenAICompatibleGenerator,
 )
-from src.loader import load_qa_jsonl
-from src.prompts import PROMPT_TEMPLATES
-from src.rag_generation import RAGGenerationConfig, evaluate_rag_answer_quality
-from src.rag_pipeline import build_retrieval_corpus, build_retrieval_index
-from src.reranker import load_reranker
+from src.datasets.loader import load_qa_jsonl
+from src.llm.prompts import PROMPT_TEMPLATES
+from src.rag.rag_generation import RAGGenerationConfig, evaluate_rag_answer_quality
+from src.rag.rag_pipeline import build_retrieval_corpus, build_retrieval_index
+from src.llm.reranker import load_reranker
 
 
 def _metrics_for_table(m: Dict[str, Any]) -> Dict[str, Any]:
@@ -39,7 +39,7 @@ def _log_run(
     m: Dict[str, Any],
     log_meta: Dict[str, str],
 ) -> None:
-    from src.experiment_tracking import log_evaluation_batch
+    from src.eval.experiment_tracking import log_evaluation_batch
 
     flat = _metrics_for_table(m)
     pe = m.get("per_example") or []

@@ -23,12 +23,12 @@ from experiments.exp_rag_generation import (
     run_compare_topk,
     run_compare_truncation,
 )
-from src.context_truncation import TruncationStrategy
-from src.embedder import load_embedding_model
-from src.financebench_loader import load_financebench_open_source
-from src.prompts import PROMPT_TEMPLATES
-from src.rag_generation import RAGGenerationConfig
-from src.reranker import load_reranker
+from src.rag.context_truncation import TruncationStrategy
+from src.llm.embedder import load_embedding_model
+from src.datasets.financebench_loader import load_financebench_open_source
+from src.llm.prompts import PROMPT_TEMPLATES
+from src.rag.rag_generation import RAGGenerationConfig
+from src.llm.reranker import load_reranker
 
 
 def main() -> None:

@@ -55,7 +55,7 @@ def load_beir_queries_as_qa_examples(
     BEIR ``queries.jsonl`` for RAG generation eval: ``question`` = topic text;
     ``answer`` = short proxy from ``metadata.query`` (TREC topic keyword line), not an official NIST span.
     """
-    from src.beir_io import load_beir_qrels, ordered_qids_from_qrels
+    from src.datasets.beir_io import load_beir_qrels, ordered_qids_from_qrels
 
     p = Path(queries_path)
     raw: List[QAExample] = []

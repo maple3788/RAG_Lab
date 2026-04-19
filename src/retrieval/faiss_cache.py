@@ -14,7 +14,7 @@ from typing import Any, List, Sequence, Tuple
 
 import faiss
 
-from src.retriever import FaissIndex
+from src.retrieval.retriever import FaissIndex
 
 CACHE_VERSION = 1
 

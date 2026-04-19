@@ -20,9 +20,13 @@ flowchart TD
 
 ## Core components
 
-- `src/document_ingest_pipeline.py`: extraction, chunking, optional summarization, embedding, artifact storage
-- `src/rag_pipeline.py`: retrieval primitives and evaluation helpers
-- `src/rag_generation.py`: generation evaluation loop and QA metrics
+- `src/ingestion/`: document ingest (extract, chunk, embed, MinIO/Milvus artifacts)
+- `src/rag/`: retrieval helpers, generation evaluation loop, context truncation
+- `src/retrieval/`: FAISS/Milvus search, hybrid BM25 fusion, chunk metadata filters
+- `src/llm/`: embedder, reranker, generators, prompt templates
+- `src/datasets/`: QA / BEIR / HF dataset loaders
+- `src/eval/`: answer metrics, RAGAS UI helpers, experiment tracking
+- `src/config/`: YAML defaults (OmegaConf) and `QueryRequest` → pipeline config mapping
 - `src/storage/`: MinIO artifacts, Redis semantic cache, Redis job status, Milvus vector store
 - `demo/app.py`: interactive UI, experiment logging, benchmark dashboard
 - `src/api/server.py`: production API path for concurrent RAG traffic

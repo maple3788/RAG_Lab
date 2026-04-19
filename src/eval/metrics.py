@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
-from src.answer_metrics import exact_match, gold_answer_hit, token_f1
+from src.eval.answer_metrics import exact_match, gold_answer_hit, token_f1
 
 
 def recall_at_k(retrieved_texts: Sequence[str], ground_truth: str) -> float:

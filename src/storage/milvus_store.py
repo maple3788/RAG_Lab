@@ -6,8 +6,8 @@ from typing import Any, List, Optional
 
 from dotenv import load_dotenv
 
-from src.embedder import EmbeddingModel, prepare_passage, prepare_query
-from src.milvus_metadata import (
+from src.llm.embedder import EmbeddingModel, prepare_passage, prepare_query
+from src.retrieval.milvus_metadata import (
     DEFAULT_SECTION,
     FIELD_DOC_DATE,
     FIELD_SECTION,

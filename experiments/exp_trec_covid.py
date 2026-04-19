@@ -26,21 +26,21 @@ from tqdm import tqdm
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.beir_io import (
+from src.datasets.beir_io import (
     corpus_list_to_dict,
     load_beir_corpus_ordered,
     load_beir_qrels,
     load_beir_queries_ordered,
     ordered_qids_from_qrels,
 )
-from src.chunker import chunk_text
-from src.embedder import (
+from src.ingestion.chunker import chunk_text
+from src.llm.embedder import (
     EmbeddingModel,
     load_embedding_model,
     prepare_passages,
     prepare_query,
 )
-from src.faiss_cache import (
+from src.retrieval.faiss_cache import (
     corpus_fingerprint,
     save_chunk_cache,
     save_doc_level_cache,
@@ -49,8 +49,8 @@ from src.faiss_cache import (
     try_load_chunk_cache,
     try_load_doc_level_cache,
 )
-from src.reranker import load_reranker
-from src.retriever import FaissIndex, build_faiss_index, search
+from src.llm.reranker import load_reranker
+from src.retrieval.retriever import FaissIndex, build_faiss_index, search
 
 
 def _default_measures(retrieve_k: int) -> list:

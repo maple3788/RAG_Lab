@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List
 
-from src.loader import QAExample
+from src.datasets.loader import QAExample
 
 
 def _load_jsonl(path: Path) -> List[Dict[str, Any]]:

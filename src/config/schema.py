@@ -8,8 +8,11 @@ from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
-from src.document_ingest_pipeline import IngestPipelineConfig
-from src.milvus_metadata import DEFAULT_SECTION, metadata_filter_to_milvus_expr
+from src.ingestion.document_ingest_pipeline import IngestPipelineConfig
+from src.retrieval.milvus_metadata import (
+    DEFAULT_SECTION,
+    metadata_filter_to_milvus_expr,
+)
 from src.storage.milvus_store import MilvusSearchConfig
 
 

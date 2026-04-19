@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List
 
-from src.loader import QAExample
+from src.datasets.loader import QAExample
 
 # Resolves to Parquet files on the Hub (see allenai/qasper discussions).
 DEFAULT_QASPER_REVISION = "refs/convert/parquet"

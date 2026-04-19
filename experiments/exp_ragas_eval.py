@@ -19,17 +19,17 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from experiments.exp_rag_generation import _make_generator
-from src.context_truncation import TruncationStrategy, truncate_context
-from src.embedder import load_embedding_model
-from src.loader import QAExample, load_qa_jsonl
-from src.prompts import PROMPT_TEMPLATES, format_rag_prompt
-from src.rag_generation import passages_to_context
-from src.rag_pipeline import (
+from src.rag.context_truncation import TruncationStrategy, truncate_context
+from src.llm.embedder import load_embedding_model
+from src.datasets.loader import QAExample, load_qa_jsonl
+from src.llm.prompts import PROMPT_TEMPLATES, format_rag_prompt
+from src.rag.rag_generation import passages_to_context
+from src.rag.rag_pipeline import (
     build_retrieval_corpus,
     build_retrieval_index,
     retrieve_passages_for_query,
 )
-from src.reranker import load_reranker
+from src.llm.reranker import load_reranker
 
 
 def _make_ragas_eval_stack(args):

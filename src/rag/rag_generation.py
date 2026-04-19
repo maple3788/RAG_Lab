@@ -7,26 +7,26 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 
-from src.answer_metrics import (
+from src.eval.answer_metrics import (
     exact_match,
     gold_answer_hit,
     mean,
     token_f1,
 )
-from src.context_truncation import TruncationStrategy, truncate_context
-from src.embedder import EmbeddingModel, prepare_query
-from src.generator import TextGenerator
-from src.loader import QAExample
-from src.prompts import format_rag_prompt
-from src.hybrid_retrieval import BM25Resources, build_bm25_resources
-from src.rag_pipeline import (
+from src.rag.context_truncation import TruncationStrategy, truncate_context
+from src.llm.embedder import EmbeddingModel, prepare_query
+from src.llm.generator import TextGenerator
+from src.datasets.loader import QAExample
+from src.llm.prompts import format_rag_prompt
+from src.retrieval.hybrid_retrieval import BM25Resources, build_bm25_resources
+from src.rag.rag_pipeline import (
     build_corpus_chunks_from_documents,
     build_retrieval_index,
     retrieve_passages_for_hyde_document,
     retrieve_passages_for_query,
 )
-from src.reranker import Reranker
-from src.retriever import FaissIndex
+from src.llm.reranker import Reranker
+from src.retrieval.retriever import FaissIndex
 
 
 def passages_to_context(passages: Sequence[str], *, separator: str = "\n\n") -> str:

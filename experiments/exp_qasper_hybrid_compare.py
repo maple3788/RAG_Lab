@@ -29,19 +29,19 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from experiments.exp_rag_generation import _make_generator
-from src.prompts import PROMPT_TEMPLATES
-from src.embedder import load_embedding_model
-from src.error_analysis import gold_in_any_chunk
-from src.hybrid_retrieval import build_bm25_resources
-from src.loader import QAExample
-from src.qasper_hf import DEFAULT_QASPER_REVISION, load_qasper_hf
-from src.rag_generation import RAGGenerationConfig, evaluate_rag_answer_quality
-from src.rag_pipeline import (
+from src.llm.prompts import PROMPT_TEMPLATES
+from src.llm.embedder import load_embedding_model
+from src.eval.error_analysis import gold_in_any_chunk
+from src.retrieval.hybrid_retrieval import build_bm25_resources
+from src.datasets.loader import QAExample
+from src.datasets.qasper_hf import DEFAULT_QASPER_REVISION, load_qasper_hf
+from src.rag.rag_generation import RAGGenerationConfig, evaluate_rag_answer_quality
+from src.rag.rag_pipeline import (
     build_corpus_chunks_from_documents,
     build_retrieval_index,
     retrieve_passages_pool_and_final,
 )
-from src.reranker import load_reranker
+from src.llm.reranker import load_reranker
 
 
 def _aliases(ex: QAExample) -> list[str]:

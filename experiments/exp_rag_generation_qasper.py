@@ -28,12 +28,12 @@ from experiments.exp_rag_generation import (
     run_compare_topk,
     run_compare_truncation,
 )
-from src.context_truncation import TruncationStrategy
-from src.embedder import load_embedding_model
-from src.prompts import PROMPT_TEMPLATES
-from src.qasper_hf import DEFAULT_QASPER_REVISION, load_qasper_hf
-from src.rag_generation import RAGGenerationConfig
-from src.reranker import load_reranker
+from src.rag.context_truncation import TruncationStrategy
+from src.llm.embedder import load_embedding_model
+from src.llm.prompts import PROMPT_TEMPLATES
+from src.datasets.qasper_hf import DEFAULT_QASPER_REVISION, load_qasper_hf
+from src.rag.rag_generation import RAGGenerationConfig
+from src.llm.reranker import load_reranker
 
 
 def main() -> None:

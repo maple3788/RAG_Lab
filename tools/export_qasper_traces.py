@@ -18,30 +18,30 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.embedder import load_embedding_model
-from src.error_analysis import (
+from src.llm.embedder import load_embedding_model
+from src.eval.error_analysis import (
     classify_failure_bucket,
     gold_in_any_chunk,
     gold_lost_to_truncation,
 )
-from src.generator import (
+from src.llm.generator import (
     GeminiGenerator,
     MockGenerator,
     OllamaGenerator,
     OpenAICompatibleGenerator,
 )
-from src.loader import QAExample
-from src.prompts import PROMPT_TEMPLATES, format_rag_prompt
-from src.rag_generation import passages_to_context
-from src.rag_pipeline import (
+from src.datasets.loader import QAExample
+from src.llm.prompts import PROMPT_TEMPLATES, format_rag_prompt
+from src.rag.rag_generation import passages_to_context
+from src.rag.rag_pipeline import (
     build_corpus_chunks_from_documents,
     build_retrieval_index,
     retrieve_passages_pool_and_final,
 )
-from src.context_truncation import TruncationStrategy, truncate_context
-from src.answer_metrics import exact_match, gold_answer_hit, token_f1
-from src.reranker import load_reranker
-from src.qasper_hf import DEFAULT_QASPER_REVISION, load_qasper_hf
+from src.rag.context_truncation import TruncationStrategy, truncate_context
+from src.eval.answer_metrics import exact_match, gold_answer_hit, token_f1
+from src.llm.reranker import load_reranker
+from src.datasets.qasper_hf import DEFAULT_QASPER_REVISION, load_qasper_hf
 
 
 def _make_generator(args: argparse.Namespace):

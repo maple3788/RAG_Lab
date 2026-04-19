@@ -27,14 +27,17 @@ from experiments.exp_rag_generation import (
     run_compare_topk,
     run_compare_truncation,
 )
-from src.beir_io import load_beir_corpus_ordered
-from src.context_truncation import TruncationStrategy
-from src.embedder import load_embedding_model
-from src.loader import load_beir_queries_as_qa_examples
-from src.prompts import PROMPT_TEMPLATES
-from src.rag_generation import RAGGenerationConfig
-from src.rag_pipeline import build_corpus_chunks_from_documents, build_retrieval_index
-from src.reranker import load_reranker
+from src.datasets.beir_io import load_beir_corpus_ordered
+from src.rag.context_truncation import TruncationStrategy
+from src.llm.embedder import load_embedding_model
+from src.datasets.loader import load_beir_queries_as_qa_examples
+from src.llm.prompts import PROMPT_TEMPLATES
+from src.rag.rag_generation import RAGGenerationConfig
+from src.rag.rag_pipeline import (
+    build_corpus_chunks_from_documents,
+    build_retrieval_index,
+)
+from src.llm.reranker import load_reranker
 
 
 def main() -> None:

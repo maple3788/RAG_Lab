@@ -9,10 +9,10 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.embedder import load_embedding_model
-from src.loader import load_qa_jsonl
-from src.rag_pipeline import build_retrieval_corpus, evaluate_retrieval
-from src.reranker import load_reranker
+from src.llm.embedder import load_embedding_model
+from src.datasets.loader import load_qa_jsonl
+from src.rag.rag_pipeline import build_retrieval_corpus, evaluate_retrieval
+from src.llm.reranker import load_reranker
 
 
 def main() -> None:

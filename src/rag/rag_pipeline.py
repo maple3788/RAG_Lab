@@ -6,18 +6,23 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from prometheus_client import Histogram
 
-from src.chunker import chunk_documents, chunks_to_texts
-from src.embedder import (
+from src.ingestion.chunker import chunk_documents, chunks_to_texts
+from src.llm.embedder import (
     EmbeddingModel,
     prepare_passage,
     prepare_passages,
     prepare_query,
 )
-from src.loader import QAExample
-from src.metrics import mean, recall_at_k
-from src.hybrid_retrieval import BM25Resources, retrieve_hybrid_pool
-from src.retriever import FaissIndex, build_faiss_index, gather_texts_by_indices, search
-from src.reranker import Reranker
+from src.datasets.loader import QAExample
+from src.eval.metrics import mean, recall_at_k
+from src.retrieval.hybrid_retrieval import BM25Resources, retrieve_hybrid_pool
+from src.retrieval.retriever import (
+    FaissIndex,
+    build_faiss_index,
+    gather_texts_by_indices,
+    search,
+)
+from src.llm.reranker import Reranker
 
 # Latency histograms (seconds, Prometheus convention). Used by ``retrieve_passages_pool_and_final``
 # and optionally by ``record_rag_*`` for code paths outside this module (e.g. Streamlit ``run_pipeline``).

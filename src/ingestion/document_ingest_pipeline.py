@@ -13,14 +13,14 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, List, Literal, Mapping, Optional, Sequence, Tuple
 
-from src.document_extract import (
+from src.ingestion.document_extract import (
     extract_pdf_text,
     extract_pdf_text_full,
     extract_text_from_bytes,
     parse_page_list,
     try_pdf_metadata_iso_date,
 )
-from src.milvus_metadata import (
+from src.retrieval.milvus_metadata import (
     DEFAULT_SECTION,
     FIELD_DOC_DATE,
     FIELD_SECTION,
@@ -29,9 +29,9 @@ from src.milvus_metadata import (
     normalize_iso_date_or_unknown,
     source_type_from_filename,
 )
-from src.embedder import load_embedding_model
-from src.ingest_rate_limit import RateLimiter
-from src.rag_pipeline import build_corpus_chunks_from_documents
+from src.llm.embedder import load_embedding_model
+from src.ingestion.ingest_rate_limit import RateLimiter
+from src.rag.rag_pipeline import build_corpus_chunks_from_documents
 from src.storage.minio_artifacts import MinioArtifactStore, load_minio_settings
 from src.storage.milvus_store import MilvusChunkStore, MilvusIndexConfig
 from src.storage.redis_jobs import JobStatus, RedisJobStore
