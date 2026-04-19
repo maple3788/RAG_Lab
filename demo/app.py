@@ -64,6 +64,7 @@ load_dotenv(ROOT / ".env")
 
 from src.rag.context_truncation import TruncationStrategy, truncate_context
 from src.ingestion.document_ingest_pipeline import (
+    load_chunk_records_from_minio,
     load_ingest_from_minio,
     run_document_ingest,
 )
@@ -110,7 +111,10 @@ from src.ingestion.streaming_parser import (
     HiddenReasoningStreamParser,
     strip_hidden_reasoning_text,
 )
-from src.eval.ragas_ui_metrics import run_ragas_legacy_evaluate
+from src.eval.ragas_ui_metrics import (
+    default_ragas_eval_model,
+    run_ragas_legacy_evaluate,
+)
 from src.rag.rag_pipeline import (
     record_rag_generation_latency,
     record_rag_retrieval_latency,
@@ -127,7 +131,6 @@ from src.eval.experiment_tracking import (
 )
 from src.eval.metrics import (
     approx_token_count,
-    composite_ragas_score,
     compute_answer_metrics,
 )
 
@@ -1617,143 +1620,6 @@ def render_rag_trace(result: dict, *, ui_id: int, final_k: int) -> None:
                     )
 
 
-def _default_ragas_eval_model(backend: str) -> str:
-    """Default evaluator model id (LangChain chat; match typical chat defaults in this app)."""
-    if backend == "openai":
-        return "gpt-4o-mini"
-    if backend == "ollama":
-        return "llama3.2"
-    if backend == "gemini":
-        return "gemini-2.5-flash"
-    return "gpt-4o-mini"
-
-
-def _ragas_score_cell(raw: Any, err: Optional[str]) -> str:
-    """Format a metric value; show N/A + reason when missing or non-finite (e.g. NaN)."""
-    if raw is None:
-        return f"N/A ({err})" if err else "N/A"
-    try:
-        x = float(raw)
-    except (TypeError, ValueError):
-        return f"N/A ({err or 'bad value'})"
-    if not math.isfinite(x):
-        return f"N/A ({err or 'non-finite score'})"
-    return f"{x:.3f}"
-
-
-def render_ragas_metrics_block(result: dict) -> None:
-    """RAGAS via ``evaluate()`` (faithfulness, context precision, answer correctness) — see exp_ragas_financebench."""
-    if not result or result.get("error"):
-        return
-    current_ui = int(st.session_state.get("last_rag_ui", 0))
-    lr = st.session_state.get("last_rag_backend", "gemini")
-    if lr == "mock":
-        lr = "gemini"
-    if "ragas_eval_backend" not in st.session_state:
-        st.session_state.ragas_eval_backend = (
-            lr if lr in ("gemini", "openai", "ollama") else "gemini"
-        )
-
-    with st.expander(
-        "RAGAS scores (context precision · faithfulness · answer correctness)",
-        expanded=False,
-    ):
-        st.caption(
-            "Optional **post-hoc** evaluation (same stack as `experiments/exp_ragas_financebench.py`: "
-            "`ragas.evaluate` + LangChain LLM/embeddings). "
-            "**Answer accuracy** uses `answer_correctness` when a reference is set; without a reference, "
-            "context relevance uses **LLM context precision (no reference)**. "
-            "Install: `pip install ragas langchain-openai` (Gemini: also `langchain-google-genai`). "
-            "If scores show **N/A**, try another evaluator model or check API keys."
-        )
-        eb_col, em_col = st.columns(2)
-        with eb_col:
-            st.selectbox(
-                "RAGAS evaluator backend",
-                options=["gemini", "openai", "ollama"],
-                key="ragas_eval_backend",
-                help="Gemini: `GEMINI_API_KEY`. OpenAI: `OPENAI_API_KEY` (+ optional `OPENAI_BASE_URL`). "
-                "Ollama: local OpenAI-compatible API.",
-            )
-        with em_col:
-            st.text_input(
-                "RAGAS evaluator model id",
-                key="ragas_eval_model",
-                placeholder="Empty = use defaults (see caption)",
-            )
-        st.caption(
-            f"Defaults if model empty: Gemini → `{_default_ragas_eval_model('gemini')}`, "
-            f"OpenAI → `{_default_ragas_eval_model('openai')}`, "
-            f"Ollama → `{_default_ragas_eval_model('ollama')}`"
-        )
-        ref = st.text_input(
-            "Reference answer (optional, for Answer accuracy)",
-            key="ragas_reference_input",
-            placeholder="Ground truth answer; leave empty to skip Answer accuracy",
-        )
-        if st.button("Compute RAGAS scores", type="secondary", key="ragas_compute_btn"):
-            backend = str(st.session_state.get("ragas_eval_backend") or "gemini")
-            model_raw = (st.session_state.get("ragas_eval_model") or "").strip()
-            model = model_raw if model_raw else _default_ragas_eval_model(backend)
-            try:
-                scores = run_ragas_legacy_evaluate(
-                    backend=backend,
-                    model=model,
-                    user_input=str(result.get("original_question") or ""),
-                    response=str(result.get("answer") or ""),
-                    retrieved_contexts=list(result.get("final_passages") or []),
-                    reference=ref.strip() if ref else None,
-                )
-                scores["evaluator_backend"] = backend
-                scores["evaluator_model"] = model
-                st.session_state["last_ragas_scores"] = scores
-                st.session_state["ragas_scores_ui_version"] = current_ui
-            except Exception as e:
-                st.session_state["last_ragas_scores"] = {"error": str(e)}
-                st.session_state["ragas_scores_ui_version"] = current_ui
-            st.rerun()
-
-        scores = st.session_state.get("last_ragas_scores")
-        ver = st.session_state.get("ragas_scores_ui_version")
-        if scores and ver is not None and int(ver) == current_ui:
-            if scores.get("error"):
-                st.error(scores["error"])
-            else:
-                eb = scores.get("evaluator_backend", "—")
-                em = scores.get("evaluator_model", "—")
-                st.caption(f"Last run: evaluator **{eb}** / `{em}`")
-                lines = ["| Metric | Score |", "| --- | --- |"]
-                lines.append(
-                    "| Context relevance | "
-                    f"{_ragas_score_cell(scores.get('context_relevance'), scores.get('context_relevance_error'))} |"
-                )
-                lines.append(
-                    "| Response groundedness | "
-                    f"{_ragas_score_cell(scores.get('response_groundedness'), scores.get('response_groundedness_error'))} |"
-                )
-                aa = scores.get("answer_accuracy")
-                if aa is not None or scores.get("answer_accuracy_error"):
-                    lines.append(
-                        "| Answer accuracy | "
-                        f"{_ragas_score_cell(aa, scores.get('answer_accuracy_error'))} |"
-                    )
-                elif scores.get("answer_accuracy_note") == "skipped":
-                    lines.append("| Answer accuracy | — (no reference) |")
-                st.markdown("\n".join(lines))
-                if scores.get("context_relevance_note"):
-                    st.caption(scores["context_relevance_note"])
-                hints = []
-                for label, key in (
-                    ("Context relevance", "context_relevance_error"),
-                    ("Response groundedness", "response_groundedness_error"),
-                    ("Answer accuracy", "answer_accuracy_error"),
-                ):
-                    if scores.get(key):
-                        hints.append(f"**{label}:** {scores[key]}")
-                if hints:
-                    st.info("Details:\n\n" + "\n\n".join(hints))
-
-
 def render_latency_summary(result: dict) -> None:
     lat = result.get("stage_latencies") or {}
     total = result.get("latency_total_ms")
@@ -1838,6 +1704,240 @@ def _runs_leaderboard_frame(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _chunks_list_from_query_row(row: Any) -> List[str]:
+    ch = _safe_json_loads(row.get("retrieved_chunks_json"))
+    if isinstance(ch, list):
+        return [str(x) for x in ch]
+    return []
+
+
+def _benchmark_ragas_explainer() -> None:
+    with st.expander("How RAGAS evaluates (what each score means)", expanded=False):
+        st.markdown(
+            """
+This dashboard calls **`ragas.evaluate()`** with the same metrics as elsewhere in the repo (faithfulness,
+context precision or LLM context precision without reference, and optional answer correctness).
+
+| Metric | Needs reference? | What it measures |
+|--------|-------------------|------------------|
+| **Faithfulness** | No | Whether statements in the **model answer** are supported by the **retrieved passages** (LLM-as-judge over contexts + answer). |
+| **Context relevance** | Optional | **With** a reference answer: **context precision** — how much retrieved context is relevant to answering correctly. **Without** a reference: **LLM context precision (no reference)** — whether passages help answer the **question**. |
+| **Answer accuracy** | **Yes** | **Answer correctness** — alignment between model answer and your **ground-truth** reference (embeddings + LLM). |
+
+Scores are typically in **[0, 1]** (higher is better). If there are **no retrieved chunks**, RAGAS cannot score faithfulness/context meaningfully.
+            """.strip()
+        )
+
+
+def _benchmark_ragas_evaluator_settings(section_key: str) -> None:
+    st.caption("Applies to every **Run RAGAS** button in this section.")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.selectbox(
+            "RAGAS evaluator backend",
+            options=["gemini", "openai", "ollama"],
+            key=f"bench_{section_key}_ragas_backend",
+            help="Gemini: `GEMINI_API_KEY`. OpenAI: `OPENAI_API_KEY`. Ollama: local OpenAI-compatible API.",
+        )
+    with c2:
+        st.text_input(
+            "RAGAS evaluator model (empty = default for backend)",
+            key=f"bench_{section_key}_ragas_model",
+            placeholder=f"Default e.g. {default_ragas_eval_model('gemini')}",
+        )
+
+
+def _benchmark_render_query_rows_with_ragas(
+    df: pd.DataFrame,
+    *,
+    section_key: str,
+    include_feedback: bool = False,
+    show_stage_trace: bool = False,
+    show_stored_db_ragas: bool = True,
+) -> None:
+    """Paginated rows: each row has optional reference + Run RAGAS button + result."""
+    if df.empty:
+        return
+
+    st.markdown("##### Browse logged rows")
+    st.caption(
+        "Controls **only** how many query rows load in the list below. "
+        "This is **not** part of RAGAS — evaluator settings are under **RAGAS evaluation**."
+    )
+    n = len(df)
+    cpg1, cpg2, cpg3 = st.columns([1, 1, 2])
+    with cpg1:
+        page_size = st.selectbox(
+            "List chunk size",
+            options=[10, 25, 50, 100],
+            index=1,
+            key=f"bench_{section_key}_page_size",
+            help="How many rows appear in the expandable list at once (performance / clutter).",
+        )
+    with cpg2:
+        n_pages = max(1, (n + int(page_size) - 1) // int(page_size))
+        page = st.number_input(
+            "List page",
+            min_value=1,
+            max_value=int(n_pages),
+            value=1,
+            step=1,
+            key=f"bench_{section_key}_page_num",
+            help="Which slice of the log to show in the list below.",
+        )
+    with cpg3:
+        st.caption(f"**{n}** queries in DB · **{int(n_pages)}** list page(s)")
+
+    page_i = int(max(1, min(int(page), int(n_pages))))
+    start = (page_i - 1) * int(page_size)
+    chunk_df = df.iloc[start : start + int(page_size)]
+
+    st.divider()
+    st.markdown("##### RAGAS evaluation")
+    _benchmark_ragas_explainer()
+    _benchmark_ragas_evaluator_settings(section_key)
+
+    for _, row in chunk_df.iterrows():
+        qid = int(row["id"])
+        qtext = str(row.get("question") or "")
+        prev = qtext.replace("\n", " ")[:88]
+        if len(qtext) > 88:
+            prev = prev + "…"
+        title = f"#{qid} · {prev}" if prev.strip() else f"#{qid}"
+        with st.expander(title, expanded=False):
+            st.caption(
+                f"latency **{row.get('latency_ms')}** ms · tokens **{row.get('token_count')}** · "
+                f"gold_hit **{row.get('gold_hit')}** · token_f1 **{row.get('token_f1')}**"
+            )
+
+            log_ref = row.get("reference_answer")
+            if log_ref is not None and pd.isna(log_ref):
+                log_ref = None
+            if log_ref:
+                st.caption(
+                    f"Logged reference (from DB): `{str(log_ref)[:500]}{'…' if len(str(log_ref)) > 500 else ''}`"
+                )
+
+            st.text_input(
+                "Reference for this RAGAS run (optional — enables answer correctness; empty uses no-reference context metric)",
+                key=f"bench_ref_field_{section_key}_{qid}",
+                placeholder="Paste ground truth here, or leave empty",
+            )
+
+            st.markdown("**Question**")
+            st.text_area(
+                "qrow",
+                qtext,
+                height=100,
+                key=f"bench_qrow_{section_key}_{qid}",
+                label_visibility="collapsed",
+            )
+            st.markdown("**Model answer**")
+            st.text_area(
+                "arow",
+                str(row.get("llm_output") or ""),
+                height=100,
+                key=f"bench_arow_{section_key}_{qid}",
+                label_visibility="collapsed",
+            )
+            ctxs = _chunks_list_from_query_row(row)
+            st.markdown(f"**Retrieved chunks** ({len(ctxs)})")
+            if ctxs:
+                for ci, passage in enumerate(ctxs):
+                    st.text_area(
+                        f"ch_{ci}",
+                        str(passage),
+                        height=min(200, max(80, len(str(passage)) // 6)),
+                        key=f"bench_ch_{section_key}_{qid}_{ci}",
+                        label_visibility="collapsed",
+                    )
+            else:
+                st.warning(
+                    "No stored passages for this row — RAGAS will report missing context."
+                )
+
+            if show_stored_db_ragas:
+                rj_db = row.get("ragas_json")
+                if rj_db is not None and pd.isna(rj_db):
+                    rj_db = None
+                if rj_db:
+                    with st.expander(
+                        "Previously logged RAGAS (from SQLite)", expanded=False
+                    ):
+                        st.json(_safe_json_loads(rj_db), expanded=False)
+
+            if show_stage_trace:
+                with st.expander("Full trace (stage_trace_json)", expanded=False):
+                    st.json(
+                        _safe_json_loads(row.get("stage_trace_json")), expanded=False
+                    )
+
+            if st.button(
+                "Run RAGAS",
+                key=f"bench_ragas_btn_{section_key}_{qid}",
+                type="primary",
+            ):
+                backend = str(
+                    st.session_state.get(f"bench_{section_key}_ragas_backend")
+                    or "gemini"
+                )
+                model_raw = (
+                    st.session_state.get(f"bench_{section_key}_ragas_model") or ""
+                ).strip()
+                model = model_raw if model_raw else default_ragas_eval_model(backend)
+                ref_raw = (
+                    st.session_state.get(f"bench_ref_field_{section_key}_{qid}") or ""
+                ).strip()
+                ans = str(row.get("llm_output") or "")
+                ctxs_eval = _chunks_list_from_query_row(row)
+                try:
+                    with st.spinner("Running RAGAS…"):
+                        scores = run_ragas_legacy_evaluate(
+                            backend=backend,
+                            model=model,
+                            user_input=qtext,
+                            response=ans,
+                            retrieved_contexts=ctxs_eval,
+                            reference=ref_raw if ref_raw else None,
+                        )
+                    if isinstance(scores, dict):
+                        scores = {
+                            **scores,
+                            "evaluator_backend": backend,
+                            "evaluator_model": model,
+                        }
+                    st.session_state[f"bench_ragas_result_{section_key}_{qid}"] = scores
+                except Exception as e:
+                    st.session_state[f"bench_ragas_result_{section_key}_{qid}"] = {
+                        "error": str(e),
+                    }
+
+            res = st.session_state.get(f"bench_ragas_result_{section_key}_{qid}")
+            if isinstance(res, dict) and res:
+                st.markdown("**Latest RAGAS result (this row)**")
+                if res.get("error"):
+                    st.error(str(res["error"]))
+                else:
+                    st.json(res, expanded=False)
+
+            if include_feedback:
+                st.divider()
+                tag = st.selectbox(
+                    "Human feedback",
+                    options=["(none)"] + list(FAILURE_FEEDBACK_LABELS),
+                    key=f"fail_fb_pick_{section_key}_{qid}",
+                )
+                if st.button(
+                    "Save feedback tag", key=f"fail_fb_save_{section_key}_{qid}"
+                ):
+                    if tag == "(none)":
+                        st.warning("Pick a label first.")
+                    else:
+                        update_query_feedback(qid, tag)
+                        st.success("Saved.")
+                        st.rerun()
+
+
 def _log_ui_rag_observation(
     *,
     question: str,
@@ -1870,25 +1970,6 @@ def _log_ui_rag_observation(
         metrics_computed["gold_hit"] = gh
         metrics_computed["exact_match"] = em
 
-    ragas = st.session_state.get("last_ragas_scores")
-    ui_ver = st.session_state.get("ragas_scores_ui_version")
-    cur_ui = int(st.session_state.get("last_rag_ui", 0))
-    if (
-        isinstance(ragas, dict)
-        and not ragas.get("error")
-        and ui_ver is not None
-        and int(ui_ver) == cur_ui
-    ):
-        for k in ("context_relevance", "response_groundedness", "answer_accuracy"):
-            if ragas.get(k) is not None:
-                try:
-                    metrics_computed[k] = float(ragas[k])
-                except (TypeError, ValueError):
-                    pass
-        comp = composite_ragas_score(ragas)
-        if comp is not None:
-            metrics_computed["ragas_composite"] = float(comp)
-
     run_id = log_experiment_run(
         source="demo/app.py",
         run_label=f"ui_query:{(job_id or 'local')[:24]}",
@@ -1914,7 +1995,7 @@ def _log_ui_rag_observation(
         gold_hit=gh,
         token_f1=f1v,
         exact_match=em,
-        ragas=ragas if isinstance(ragas, dict) else None,
+        ragas=None,
         run_id=run_id,
         stage_trace=result.get("stage_trace"),
     )
@@ -1941,9 +2022,10 @@ def _ui_benchmark() -> None:
     with m4:
         st.metric("Tokens (query table)", f"{int(totals['query_table_tokens']):,}")
 
-    tab_lb, tab_fail, tab_cost, tab_jobs = st.tabs(
+    tab_lb, tab_qlog, tab_fail, tab_cost, tab_jobs = st.tabs(
         [
             "Performance Leaderboard",
+            "Query log (RAGAS)",
             "Failure analysis",
             "Cost calculator",
             "Job metadata (Redis)",
@@ -1988,6 +2070,13 @@ def _ui_benchmark() -> None:
                 if c in flat.columns
             ]
             st.dataframe(flat[show_cols], use_container_width=True, hide_index=True)
+            _benchmark_ragas_explainer()
+            st.info(
+                "**Run RAGAS** buttons are on each **query** row in **Query log** and **Failure analysis**. "
+                "Those rows include the question, model answer, and retrieved passages. "
+                "Leaderboard entries here are **aggregate experiment runs** (batch summaries), not single queries, "
+                "so RAGAS is not run from this table."
+            )
 
             plot_rows: List[dict[str, Any]] = []
             for _, row in df_runs.iterrows():
@@ -2045,11 +2134,53 @@ def _ui_benchmark() -> None:
                     "Need runs with both **latency_ms** and **token_f1** or **ragas_composite** to plot."
                 )
 
+    with tab_qlog:
+        st.subheader("Query-level log")
+        st.caption(
+            "Open a row below to see question, answer, and passages. Use **Run RAGAS** to evaluate on demand "
+            "(optional reference). Previously logged scores appear under **Previously logged RAGAS** when present."
+        )
+        df_q = fetch_queries_dataframe()
+        if df_q.empty:
+            st.info(
+                "No query events yet. Enable logging on **Query** or run scripted experiments."
+            )
+        else:
+            compact_cols = [
+                c
+                for c in (
+                    "id",
+                    "run_id",
+                    "created_at",
+                    "source",
+                    "latency_ms",
+                    "token_count",
+                    "gold_hit",
+                    "token_f1",
+                    "ragas_faithfulness",
+                    "ragas_context_precision",
+                    "ragas_answer_accuracy",
+                )
+                if c in df_q.columns
+            ]
+            q_preview = df_q[compact_cols].copy()
+            if "question" in df_q.columns:
+                q_preview["question_preview"] = (
+                    df_q["question"].astype(str).str.slice(0, 120)
+                )
+            st.dataframe(q_preview, use_container_width=True, hide_index=True)
+            _benchmark_render_query_rows_with_ragas(
+                df_q,
+                section_key="qlog",
+                include_feedback=False,
+                show_stage_trace=False,
+            )
+
     with tab_fail:
         st.subheader("Bad-case review")
         st.caption(
             "Rows where **gold hit** missed (gold_hit below 0.5) or **token F1** is below 0.2. "
-            "Provide a reference answer on the **Query** page to populate these fields for UI runs."
+            "Each row has **Run RAGAS** + optional reference. Human feedback is saved per query id."
         )
         df_fail = fetch_queries_dataframe(failed_only=True)
         if not df_fail.empty:
@@ -2062,59 +2193,33 @@ def _ui_benchmark() -> None:
                 "No failed queries logged yet (or no reference / metrics captured)."
             )
         else:
-            ids = [int(x) for x in df_fail["id"].tolist()]
-            pick = st.selectbox("Select query id", ids, format_func=lambda i: f"#{i}")
-            row = df_fail[df_fail["id"] == pick].iloc[0]
-            q1, q2, q3 = st.columns(3)
-            with q1:
-                st.markdown("**User query**")
-                st.text_area(
-                    "q",
-                    str(row.get("question") or ""),
-                    height=220,
-                    key="bad_q",
-                    label_visibility="collapsed",
+            q_preview_f = df_fail[
+                [
+                    c
+                    for c in (
+                        "id",
+                        "run_id",
+                        "created_at",
+                        "gold_hit",
+                        "token_f1",
+                        "ragas_faithfulness",
+                        "ragas_context_precision",
+                        "ragas_answer_accuracy",
+                    )
+                    if c in df_fail.columns
+                ]
+            ].copy()
+            if "question" in df_fail.columns:
+                q_preview_f["question_preview"] = (
+                    df_fail["question"].astype(str).str.slice(0, 120)
                 )
-            with q2:
-                st.markdown("**Retrieved chunks (final context)**")
-                chunks = _safe_json_loads(row.get("retrieved_chunks_json"))
-                if isinstance(chunks, list):
-                    blob = "\n\n---\n\n".join(str(c) for c in chunks)
-                else:
-                    blob = str(chunks)
-                st.text_area(
-                    "ctx", blob, height=220, key="bad_ctx", label_visibility="collapsed"
-                )
-            with q3:
-                st.markdown("**LLM output**")
-                st.text_area(
-                    "out",
-                    str(row.get("llm_output") or ""),
-                    height=220,
-                    key="bad_out",
-                    label_visibility="collapsed",
-                )
-            st.caption(
-                f"gold_hit={row.get('gold_hit')} · token_f1={row.get('token_f1')} · "
-                f"latency_ms={row.get('latency_ms')} · tokens={row.get('token_count')}"
+            st.dataframe(q_preview_f, use_container_width=True, hide_index=True)
+            _benchmark_render_query_rows_with_ragas(
+                df_fail,
+                section_key="fail",
+                include_feedback=True,
+                show_stage_trace=True,
             )
-            with st.expander("Full trace (stage_trace_json)"):
-                st.json(_safe_json_loads(row.get("stage_trace_json")), expanded=False)
-
-            fb_col, _ = st.columns([1, 2])
-            with fb_col:
-                tag = st.selectbox(
-                    "Human feedback",
-                    options=["(none)"] + list(FAILURE_FEEDBACK_LABELS),
-                    key="fail_fb_pick",
-                )
-                if st.button("Save feedback tag", key="fail_fb_save"):
-                    if tag == "(none)":
-                        st.warning("Pick a label first.")
-                    else:
-                        update_query_feedback(int(pick), tag)
-                        st.success("Saved.")
-                        st.rerun()
 
     with tab_cost:
         st.subheader("Cost calculator (RMB estimates)")
@@ -2619,6 +2724,8 @@ def _ui_library() -> None:
         st.info("No jobs yet. Run an **Ingest** first.")
         return
 
+    label_by_id = {r["job_id"]: _job_label_for_select(r) for r in rows}
+
     st.dataframe(
         rows,
         use_container_width=True,
@@ -2640,13 +2747,66 @@ def _ui_library() -> None:
     st.caption(f"**{len(rows)}** job(s) in bucket `{load_minio_settings().bucket}`.")
 
     st.divider()
+    st.subheader("Inspect chunks")
+    st.caption(
+        "Select a **job_id** to load chunk records from MinIO (``chunks.json``): full text, "
+        "optional summary, and metadata per chunk."
+    )
+    inspect_opts = [r["job_id"] for r in rows]
+    inspect_id = st.selectbox(
+        "Document (job)",
+        options=inspect_opts,
+        format_func=lambda jid: label_by_id.get(jid, jid),
+        key="library_inspect_job",
+    )
+    if st.button("Load chunks for inspection", key="library_inspect_btn"):
+        try:
+            recs = load_chunk_records_from_minio(inspect_id)
+            st.session_state["library_chunk_records"] = recs
+            st.session_state["library_inspect_active"] = inspect_id
+        except Exception as e:
+            st.error(str(e))
+    active = st.session_state.get("library_inspect_active")
+    recs_view = st.session_state.get("library_chunk_records")
+    if active == inspect_id and isinstance(recs_view, list) and recs_view:
+        st.success(f"**{len(recs_view)}** chunk(s) for `{inspect_id}`")
+        for rec in recs_view:
+            idx = int(rec.get("index", 0))
+            title = f"Chunk {idx}"
+            with st.expander(title, expanded=False):
+                summ = rec.get("summary")
+                if summ:
+                    st.markdown("**Summary**")
+                    st.text_area(
+                        "s",
+                        str(summ),
+                        height=min(120, max(60, len(str(summ)) // 4)),
+                        key=f"lib_sum_{inspect_id}_{idx}",
+                        label_visibility="collapsed",
+                    )
+                st.markdown("**Text**")
+                tx = str(rec.get("text") or "")
+                st.text_area(
+                    "t",
+                    tx,
+                    height=min(360, max(120, len(tx) // 5)),
+                    key=f"lib_txt_{inspect_id}_{idx}",
+                    label_visibility="collapsed",
+                )
+                meta_bits = {
+                    k: rec.get(k) for k in rec if k not in ("text", "summary", "index")
+                }
+                if any(v is not None for v in meta_bits.values()):
+                    st.caption("Metadata")
+                    st.json(meta_bits, expanded=False)
+
+    st.divider()
     st.subheader("Remove from library")
     st.caption(
         "Deletes the job prefix in MinIO (chunks + metadata). "
         "Optional: clears Redis ingest status. If this job is loaded in **Query**, memory is unloaded."
     )
     options = [r["job_id"] for r in rows]
-    label_by_id = {r["job_id"]: _job_label_for_select(r) for r in rows}
     to_remove = st.selectbox(
         "Job to remove",
         options=options,
@@ -3111,7 +3271,6 @@ def _ui_query() -> None:
             render_rag_trace(result, ui_id=ui_id, final_k=fk)
             render_latency_summary(result)
             render_stage_trace(result)
-            render_ragas_metrics_block(result)
         else:
             st.info("Trace appears after the first answer.")
 

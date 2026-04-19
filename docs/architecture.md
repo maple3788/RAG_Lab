@@ -52,6 +52,11 @@ Recommended production defaults:
 
 - MinIO stores immutable ingest artifacts (`chunks.json`, `faiss.index`, metadata)
 - Redis stores ingest progress and semantic cache entries
-- SQLite (`results/experiment_db.sqlite`) stores experiment/query telemetry
+- SQLite (default `src/results/experiment_db.sqlite`, override with `RAG_EXPERIMENT_DB`) stores experiment/query telemetry
 - Milvus stores searchable vectors for service-style retrieval
+
+### Milvus collection naming
+
+Ingest derives names like `rag_chunks_<hash>` from the **embedding model** and **index parameters** (metric, IVF/HNSW settings)—not from chunk size, extraction mode, or summarization strategy. Runs that share those vector-store settings use the **same collection**; rows are separated by **`job_id`** (and metadata filters), so different ingest presets can still target one physical collection.
+
 

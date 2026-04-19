@@ -12,3 +12,4 @@ analysis/*.jsonl
 
 # Local experiment run database (created by Streamlit / scripts)
 results/experiment_db.sqlite
+src/results/

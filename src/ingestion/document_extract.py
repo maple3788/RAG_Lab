@@ -4,7 +4,24 @@ from __future__ import annotations
 
 import io
 import re
-from typing import Iterable, List, Optional
+import logging
+from typing import Any, Iterable, List, Literal, Optional
+
+_log = logging.getLogger(__name__)
+
+
+def pdf_ocr_dependency_error() -> Optional[str]:
+    """
+    If PDF rasterization / OCR deps are missing, return a short error string.
+    Used to surface actionable install hints (especially on Python 3.13 where
+    ``rapidocr-onnxruntime`` 1.4+ may not install).
+    """
+    try:
+        import pypdfium2  # noqa: F401
+        from rapidocr_onnxruntime import RapidOCR  # noqa: F401
+    except ImportError as e:
+        return str(e)
+    return None
 
 
 def try_pdf_metadata_iso_date(data: bytes) -> Optional[str]:
@@ -49,6 +66,29 @@ def extract_text_from_bytes(name: str, data: bytes) -> str:
     if lower.endswith(".pdf"):
         return extract_pdf_text(data, page_indices=None)
     return data.decode("utf-8", errors="replace")
+
+
+def extract_pdf_for_ingest(
+    data: bytes,
+    *,
+    page_indices: Optional[List[int]],
+    extraction: Literal["shallow", "full"],
+) -> str:
+    """
+    PDF text for ingest.
+
+    ``full`` uses layout-aware extraction, cleanup, and OCR on nearly-empty pages.
+
+    ``shallow`` uses fast pypdf text only; if that yields no usable text (common for
+    scanned PDFs or some CJK layouts), this automatically retries with the same
+    full pipeline so users do not need to switch extraction mode manually.
+    """
+    if extraction == "full":
+        return extract_pdf_text_full(data, page_indices=page_indices)
+    text = extract_pdf_text(data, page_indices=page_indices)
+    if (text or "").strip():
+        return text
+    return extract_pdf_text_full(data, page_indices=page_indices)
 
 
 def extract_pdf_text(data: bytes, *, page_indices: Optional[List[int]]) -> str:
@@ -172,40 +212,99 @@ def _extract_page_text_layout(page: object) -> str:
         return ""
 
 
-def _ocr_pages_optional(data: bytes, page_zero_indices: List[int]) -> dict[int, str]:
+def _join_rapidocr_texts(result: object) -> str:
     """
-    Optional OCR fallback for scanned pages.
-    Requires both:
-      - pypdfium2
-      - rapidocr-onnxruntime
-    If unavailable, returns empty dict.
+    Normalize RapidOCR outputs across versions:
+
+    - New API: ``RapidOCROutput`` / similar with ``.txts``
+    - Legacy: ``[[box, text, score], ...]`` or ``(result, elapsed)`` unpack
+    """
+    if result is None:
+        return ""
+    txts = getattr(result, "txts", None)
+    if txts is not None:
+        if isinstance(txts, (str, bytes)):
+            return str(txts).strip()
+        parts: List[str] = []
+        for t in txts:
+            s = str(t).strip()
+            if s:
+                parts.append(s)
+        return "\n".join(parts)
+    if isinstance(result, (list, tuple)) and result:
+        parts: List[str] = []
+        for item in result:
+            if not item:
+                continue
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                cell = item[1]
+                if isinstance(cell, (list, tuple)) and cell:
+                    cell = cell[0]
+                s = str(cell).strip()
+                if s:
+                    parts.append(s)
+            elif isinstance(item, dict):
+                s = str(item.get("text") or item.get("txt") or "").strip()
+                if s:
+                    parts.append(s)
+        return "\n".join(parts)
+    return ""
+
+
+def _call_rapidocr(ocr: Any, arr: Any, *, text_score: Optional[float]) -> str:
+    """Invoke RapidOCR; supports optional ``text_score`` (newer packages)."""
+    if text_score is not None:
+        try:
+            raw = ocr(arr, text_score=text_score)
+        except TypeError:
+            raw = ocr(arr)
+    else:
+        raw = ocr(arr)
+    if isinstance(raw, tuple) and len(raw) >= 1:
+        result = raw[0]
+    else:
+        result = raw
+    return _join_rapidocr_texts(result).strip()
+
+
+def _ocr_pages_optional(
+    data: bytes,
+    page_zero_indices: List[int],
+    *,
+    scale: float = 2.5,
+    text_score: Optional[float] = None,
+) -> dict[int, str]:
+    """
+    Optional OCR for PDF page images (rendered via pypdfium2).
+
+    Requires ``pypdfium2`` and ``rapidocr-onnxruntime``. If imports fail or every
+    page errors, returns an empty dict.
     """
     try:
         import numpy as np  # type: ignore
         import pypdfium2 as pdfium  # type: ignore
         from rapidocr_onnxruntime import RapidOCR  # type: ignore
+    except ImportError as e:
+        _log.warning(
+            "PDF OCR skipped (install pypdfium2 + rapidocr-onnxruntime): %s", e
+        )
+        return {}
+
+    try:
+        ocr = RapidOCR()
     except Exception:
         return {}
 
-    ocr = RapidOCR()
     pdf = pdfium.PdfDocument(data)
     out: dict[int, str] = {}
     for i in page_zero_indices:
         try:
             page = pdf[i]
-            bitmap = page.render(scale=2.0).to_pil()
-            arr = np.array(bitmap)
-            result, _ = ocr(arr)
-            if not result:
-                continue
-            lines: List[str] = []
-            for item in result:
-                # RapidOCR result row shape: [box, text, score]
-                if len(item) >= 2:
-                    txt = str(item[1]).strip()
-                    if txt:
-                        lines.append(txt)
-            merged = "\n".join(lines).strip()
+            pil = page.render(scale=scale).to_pil()
+            if getattr(pil, "mode", None) != "RGB":
+                pil = pil.convert("RGB")
+            arr = np.array(pil)
+            merged = _call_rapidocr(ocr, arr, text_score=text_score)
             if merged:
                 out[i] = merged
         except Exception:
@@ -213,16 +312,33 @@ def _ocr_pages_optional(data: bytes, page_zero_indices: List[int]) -> dict[int, 
     return out
 
 
+def _ocr_full_document_fallback(
+    data: bytes, page_zero_indices: List[int]
+) -> dict[int, str]:
+    """
+    When normal extraction + sparse-page OCR still yield nothing, retry OCR on
+    every page with stronger rendering (higher scale) and looser confidence.
+    """
+    if not page_zero_indices:
+        return {}
+    for scale in (3.0, 4.5, 6.0):
+        for ts in (None, 0.35, 0.15, 0.05):
+            got = _ocr_pages_optional(
+                data, page_zero_indices, scale=scale, text_score=ts
+            )
+            if any((t or "").strip() for t in got.values()):
+                return got
+    return {}
+
+
 def extract_pdf_text_full(data: bytes, *, page_indices: Optional[List[int]]) -> str:
     """
-    Richer PDF extraction than ``extract_pdf_text`` for ingestion ``full`` mode.
+    Richer PDF extraction than ``extract_pdf_text``.
 
-    Current behavior:
-    - adds explicit page boundaries (``[PAGE N]``) to preserve locality
-    - applies line-break / whitespace cleanup for cleaner chunking
-
-    This is intentionally model-agnostic (no OCR dependency); OCR/table extraction can
-    be layered on top later without changing call sites.
+    - Layout-aware pypdf text, optional per-page OCR when text is sparse (``< 40`` chars).
+    - If the combined result is still empty, runs **whole-document OCR** (all pages,
+      higher render scale, looser confidence) for scanned or image-only PDFs.
+    - Adds ``[PAGE N]`` markers; OCR-sourced blocks are tagged ``[OCR]``.
     """
     from pypdf import PdfReader
 
@@ -258,7 +374,22 @@ def extract_pdf_text_full(data: bytes, *, page_indices: Optional[List[int]]) -> 
         if used_ocr:
             prefix += " [OCR]"
         blocks.append(f"{prefix}\n{cleaned}")
-    return "\n\n".join(blocks)
+
+    merged_primary = "\n\n".join(blocks)
+    if merged_primary.strip():
+        return merged_primary
+
+    # Whole-document OCR: image-only / CJK PDFs where pypdf is empty but OCR works
+    fb = _ocr_full_document_fallback(data, indices)
+    blocks_fb: List[str] = []
+    for i in indices:
+        page_txt = fb.get(i, "") or ""
+        cleaned = _cleanup_page_text(page_txt)
+        cleaned = _normalize_tables(cleaned)
+        if not cleaned:
+            continue
+        blocks_fb.append(f"[PAGE {i + 1}] [OCR]\n{cleaned}")
+    return "\n\n".join(blocks_fb)
 
 
 def parse_page_list(spec: str) -> Optional[List[int]]:

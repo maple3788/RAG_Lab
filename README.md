@@ -67,5 +67,6 @@ rag-lab
 
 ## Notes
 
+- Scanned or image-only PDFs need **OCR**: `pypdfium2` and `rapidocr-onnxruntime` from `requirements.txt`. On **Python 3.13**, install `rapidocr-onnxruntime` **1.2.x** (1.4+ does not publish wheels for 3.13 yet); `pip install -r requirements.txt` picks a compatible version.
 - Keep secrets in `.env` only. Do not commit it.
 - For Gemini region/API constraints, see [`docs/gemini-region-restriction.md`](docs/gemini-region-restriction.md).

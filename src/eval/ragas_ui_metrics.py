@@ -32,6 +32,18 @@ from dotenv import load_dotenv
 _log = logging.getLogger(__name__)
 
 
+def default_ragas_eval_model(backend: str) -> str:
+    """Default RAGAS evaluator chat model id per backend (Streamlit + API)."""
+    b = (backend or "").strip().lower()
+    if b == "openai":
+        return "gpt-4o-mini"
+    if b == "ollama":
+        return "llama3.2"
+    if b == "gemini":
+        return "gemini-2.5-flash"
+    return "gpt-4o-mini"
+
+
 def _resolve_metric(m: Any, name: str) -> Any:
     """Normalize ragas metric imports across versions (same idea as exp_ragas_financebench)."""
     if m is None:

@@ -86,7 +86,16 @@ def init_db(path: Optional[Path] = None) -> Path:
             """
         )
         conn.commit()
+        _migrate_experiment_schema(conn)
+        conn.commit()
     return p
+
+
+def _migrate_experiment_schema(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("PRAGMA table_info(experiment_queries)").fetchall()
+    cols = {str(r[1]) for r in rows}
+    if "ragas_json" not in cols:
+        conn.execute("ALTER TABLE experiment_queries ADD COLUMN ragas_json TEXT")
 
 
 def log_experiment_run(
@@ -165,6 +174,14 @@ def log_query_event(
     p = path or get_db_path()
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     rf = ragas or {}
+    ragas_blob: Optional[str] = None
+    if rf:
+        try:
+            ragas_blob = json.dumps(rf, ensure_ascii=False, default=str)
+        except Exception:
+            ragas_blob = json.dumps(
+                {"error": "ragas serialization failed"}, ensure_ascii=False
+            )
     with _connect(p) as conn:
         cur = conn.execute(
             """
@@ -173,8 +190,8 @@ def log_query_event(
               retrieved_chunks_json, latency_ms, token_count,
               gold_hit, token_f1, exact_match,
               ragas_faithfulness, ragas_context_precision, ragas_answer_accuracy,
-              human_feedback, model_config_json, stage_trace_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              human_feedback, model_config_json, stage_trace_json, ragas_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -195,6 +212,7 @@ def log_query_event(
                 None,
                 json.dumps(model_config, ensure_ascii=False),
                 json.dumps(stage_trace, ensure_ascii=False) if stage_trace else None,
+                ragas_blob,
             ),
         )
         conn.commit()

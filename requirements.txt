@@ -21,7 +21,8 @@ streamlit>=1.28.0
 plotly>=5.18.0
 pypdf>=4.0.0
 pypdfium2>=4.30.0
-rapidocr-onnxruntime>=1.4.0
+# 1.4.x wheels cap at Python <3.13; 3.13 needs 1.2.x (still supports Chinese OCR)
+rapidocr-onnxruntime>=1.2.0
 minio>=7.2.0
 redis>=5.0.0
 pymilvus>=2.4.0

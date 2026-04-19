@@ -14,10 +14,10 @@ from dataclasses import dataclass
 from typing import Any, Callable, List, Literal, Mapping, Optional, Sequence, Tuple
 
 from src.ingestion.document_extract import (
-    extract_pdf_text,
-    extract_pdf_text_full,
+    extract_pdf_for_ingest,
     extract_text_from_bytes,
     parse_page_list,
+    pdf_ocr_dependency_error,
     try_pdf_metadata_iso_date,
 )
 from src.retrieval.milvus_metadata import (
@@ -190,10 +190,11 @@ def run_document_ingest(
         pages = parse_page_list(page_filter_spec)
         lower = filename.lower()
         if lower.endswith(".pdf"):
-            if config.extraction == "shallow":
-                text = extract_pdf_text(raw_bytes, page_indices=pages)
-            else:
-                text = extract_pdf_text_full(raw_bytes, page_indices=pages)
+            text = extract_pdf_for_ingest(
+                raw_bytes,
+                page_indices=pages,
+                extraction=config.extraction,
+            )
         else:
             text = extract_text_from_bytes(filename, raw_bytes)
             if pages:
@@ -201,7 +202,21 @@ def run_document_ingest(
                 pass
 
         if not text.strip():
-            raise ValueError("No text extracted from document")
+            if lower.endswith(".pdf"):
+                miss = pdf_ocr_dependency_error()
+                if miss:
+                    raise ValueError(
+                        "No text extracted from this PDF. It looks like a scanned or "
+                        "image-based file; OCR is required but libraries are missing. "
+                        "From the project venv run: "
+                        "pip install -U pypdfium2 'rapidocr-onnxruntime>=1.2.0' "
+                        f"(Python 3.13 needs rapidocr 1.2.x, not 1.4+). Import error: {miss}"
+                    )
+            raise ValueError(
+                "No text extracted from document. The PDF may be encrypted, corrupted, "
+                "or consist only of images that OCR could not read. Try re-exporting "
+                "as a text-based PDF or split into smaller files."
+            )
 
         src_type = source_type_from_filename(filename)
         section_label = (config.doc_section or "").strip() or DEFAULT_SECTION

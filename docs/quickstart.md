@@ -13,6 +13,8 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
+Scanned or image-only PDFs need OCR libraries (`pypdfium2`, `rapidocr-onnxruntime`) pulled in by `requirements.txt`. On **Python 3.13**, use a `rapidocr-onnxruntime` release that publishes wheels for your platform (the README Notes section summarizes version constraints).
+
 Recommended `.env` variables for local runs:
 - `OLLAMA_BASE_URL`
 - `MILVUS_URI`, `MILVUS_COLLECTION`
