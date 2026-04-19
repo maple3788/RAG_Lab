@@ -11,13 +11,23 @@ import hashlib
 import json
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Literal, Mapping, Optional, Sequence, Tuple
 
 from src.document_extract import (
     extract_pdf_text,
     extract_pdf_text_full,
     extract_text_from_bytes,
     parse_page_list,
+    try_pdf_metadata_iso_date,
+)
+from src.milvus_metadata import (
+    DEFAULT_SECTION,
+    FIELD_DOC_DATE,
+    FIELD_SECTION,
+    FIELD_SOURCE_TYPE,
+    UNKNOWN_DOC_DATE,
+    normalize_iso_date_or_unknown,
+    source_type_from_filename,
 )
 from src.embedder import load_embedding_model
 from src.ingest_rate_limit import RateLimiter
@@ -45,17 +55,27 @@ class IngestPipelineConfig:
     milvus_hnsw_m: int = 16
     milvus_hnsw_ef_construction: int = 200
     milvus_upsert_batch_size: int = 256
+    #: Optional ISO date ``YYYY-MM-DD`` for all chunks (overrides PDF metadata when set).
+    doc_date: Optional[str] = None
+    #: Logical section label for flat chunking (e.g. ``document``, ``abstract``).
+    doc_section: str = DEFAULT_SECTION
 
 
 def _chunks_to_records(
     texts: Sequence[str],
     summaries: Optional[Sequence[str]],
+    chunk_metadatas: Optional[Sequence[Mapping[str, str]]] = None,
 ) -> List[dict[str, Any]]:
     out: List[dict[str, Any]] = []
     for i, t in enumerate(texts):
         row: dict[str, Any] = {"index": i, "text": t}
         if summaries is not None and i < len(summaries):
             row["summary"] = summaries[i]
+        if chunk_metadatas is not None and i < len(chunk_metadatas):
+            m = chunk_metadatas[i]
+            row[FIELD_DOC_DATE] = m.get(FIELD_DOC_DATE, UNKNOWN_DOC_DATE)
+            row[FIELD_SECTION] = m.get(FIELD_SECTION, DEFAULT_SECTION)
+            row[FIELD_SOURCE_TYPE] = m.get(FIELD_SOURCE_TYPE, "other")
         out.append(row)
     return out
 
@@ -78,7 +98,9 @@ def _collection_name_for_config(config: IngestPipelineConfig) -> str:
         "hnsw_m": int(config.milvus_hnsw_m),
         "hnsw_ef_construction": int(config.milvus_hnsw_ef_construction),
     }
-    sig = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:10]
+    sig = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[
+        :10
+    ]
     return f"rag_chunks_{sig}"
 
 
@@ -112,8 +134,7 @@ def _run_summarization(
         rate_limiter.acquire()
         prompt = (
             "Summarize the following passage in 2-3 sentences for retrieval indexing. "
-            "Passage:\n\n"
-            + ch[:8000]
+            "Passage:\n\n" + ch[:8000]
         )
         summaries.append(summarizer(prompt))
 
@@ -149,7 +170,9 @@ def run_document_ingest(
     store = minio or MinioArtifactStore(load_minio_settings())
     rds = redis_store or RedisJobStore()
 
-    def _status(stage: str, msg: str = "", error: Optional[str] = None, **meta: Any) -> None:
+    def _status(
+        stage: str, msg: str = "", error: Optional[str] = None, **meta: Any
+    ) -> None:
         st: Any = stage
         rds.set_status(
             JobStatus(
@@ -180,6 +203,16 @@ def run_document_ingest(
         if not text.strip():
             raise ValueError("No text extracted from document")
 
+        src_type = source_type_from_filename(filename)
+        section_label = (config.doc_section or "").strip() or DEFAULT_SECTION
+        resolved_date = UNKNOWN_DOC_DATE
+        if (config.doc_date or "").strip():
+            resolved_date = normalize_iso_date_or_unknown(config.doc_date)
+        elif lower.endswith(".pdf"):
+            pdf_d = try_pdf_metadata_iso_date(raw_bytes)
+            if pdf_d:
+                resolved_date = normalize_iso_date_or_unknown(pdf_d)
+
         _status("chunking", "chunking + summarization")
         rate = RateLimiter(min_interval_seconds=config.llm_min_interval_seconds)
         chunks = build_corpus_chunks_from_documents(
@@ -193,6 +226,15 @@ def run_document_ingest(
             rate_limiter=rate,
             summarizer=summarizer,
         )
+
+        chunk_metadatas: List[dict[str, str]] = [
+            {
+                FIELD_DOC_DATE: resolved_date,
+                FIELD_SECTION: section_label,
+                FIELD_SOURCE_TYPE: src_type,
+            }
+            for _ in chunks
+        ]
 
         _status("embedding", "embedding + upsert to Milvus")
         embedder = load_embedding_model(config.embedding_model, normalize=True)
@@ -212,20 +254,30 @@ def run_document_ingest(
             batch_size=int(config.milvus_upsert_batch_size),
             index_config=index_cfg,
             collection_name=target_collection,
+            chunk_metadatas=chunk_metadatas,
         )
 
         _status("storing", "uploading to MinIO")
         prefix = f"{jid}/"
-        store.put_bytes(prefix + "source.bin", raw_bytes, content_type="application/octet-stream")
+        store.put_bytes(
+            prefix + "source.bin", raw_bytes, content_type="application/octet-stream"
+        )
         store.put_json(
             prefix + "extracted_text.json",
             {"filename": filename, "chars": len(text), "preview": text[:2000]},
         )
-        records = _chunks_to_records(chunks, summaries if summaries else None)
+        records = _chunks_to_records(
+            chunks,
+            summaries if summaries else None,
+            chunk_metadatas=chunk_metadatas,
+        )
         store.put_json(prefix + "chunks.json", {"chunks": records})
         meta = {
             "job_id": jid,
             "filename": filename,
+            FIELD_DOC_DATE: resolved_date,
+            FIELD_SECTION: section_label,
+            FIELD_SOURCE_TYPE: src_type,
             "embedding_model": config.embedding_model,
             "chunk_size": config.chunk_size,
             "chunk_overlap": config.chunk_overlap,
@@ -252,6 +304,18 @@ def run_document_ingest(
     except Exception as e:
         _status("failed", str(e), error=repr(e))
         raise
+
+
+def load_chunk_records_from_minio(
+    job_id: str,
+    *,
+    minio: Optional[MinioArtifactStore] = None,
+) -> list[dict[str, Any]]:
+    """Return chunk rows from MinIO (includes ``text`` and optional metadata fields)."""
+    store = minio or MinioArtifactStore(load_minio_settings())
+    prefix = f"{job_id}/"
+    chunks_payload = store.get_json(prefix + "chunks.json")
+    return list(chunks_payload.get("chunks") or [])
 
 
 def load_ingest_from_minio(

@@ -63,11 +63,19 @@ from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
 from src.context_truncation import TruncationStrategy, truncate_context
-from src.document_ingest_pipeline import (
-    IngestPipelineConfig,
-    load_ingest_from_minio,
-    run_document_ingest,
+from src.document_ingest_pipeline import load_ingest_from_minio, run_document_ingest
+from src.config import (
+    MetadataFilterConfig,
+    MilvusRuntimeConfig,
+    PipelineFeaturesConfig,
+    PromptConfig,
+    RAGPipelineConfig,
+    RetrievalConfig,
+    SemanticCacheConfig,
+    load_ingest_config,
+    merge_ingest_with_dict,
 )
+from src.milvus_metadata import metadata_filter_to_milvus_expr
 from src.embedder import EmbeddingModel, load_embedding_model, prepare_query
 from src.generator import (
     ChatTextGenerator,
@@ -91,7 +99,10 @@ from src.storage.milvus_store import (
 )
 from src.storage.redis_jobs import RedisJobStore
 from src.storage.redis_semantic_cache import RedisSemanticCache
-from src.streaming_parser import HiddenReasoningStreamParser, strip_hidden_reasoning_text
+from src.streaming_parser import (
+    HiddenReasoningStreamParser,
+    strip_hidden_reasoning_text,
+)
 from src.ragas_ui_metrics import run_ragas_legacy_evaluate
 from src.rag_pipeline import record_rag_generation_latency, record_rag_retrieval_latency
 from src.experiment_tracking import (
@@ -160,7 +171,9 @@ RAG_SYSTEM_PROMPT = (
 REWRITE_SYSTEM_PROMPT = "You rewrite user questions for retrieval quality."
 DECOMPOSE_SYSTEM_PROMPT = "You decompose questions into focused retrieval sub-queries."
 FILTER_SYSTEM_PROMPT = "You generate retrieval include/exclude keyword filters."
-REFLECTION_SYSTEM_PROMPT = "You audit RAG answers and request follow-up retrieval only when needed."
+REFLECTION_SYSTEM_PROMPT = (
+    "You audit RAG answers and request follow-up retrieval only when needed."
+)
 
 
 @st.cache_resource
@@ -219,7 +232,9 @@ def _retrieval_merge_key(row: dict) -> Union[int, Tuple[str, str, int]]:
     return int(row["chunk_index"])
 
 
-def _apply_multi_doc_prefixes(passages: List[str], retrieved_rows: List[dict]) -> List[str]:
+def _apply_multi_doc_prefixes(
+    passages: List[str], retrieved_rows: List[dict]
+) -> List[str]:
     """Prefix passages when chunks come from more than one ingest job."""
     tj = {str(r["text"]): r.get("job_id") for r in retrieved_rows if r.get("text")}
     jobs = {tj.get(p) for p in passages if tj.get(p)}
@@ -241,6 +256,7 @@ def _milvus_search_multi_jobs(
     top_k: int,
     index_type_default: str,
     search_config: MilvusSearchConfig,
+    metadata_filter_expr: Optional[str] = None,
 ) -> List[dict]:
     """Search across multiple jobs (possibly multiple Milvus collections)."""
     minio = MinioArtifactStore()
@@ -251,13 +267,17 @@ def _milvus_search_multi_jobs(
         meta = minio.get_job_metadata(j) or {}
         coll = str(meta.get("milvus_collection") or "").strip() or None
         if not coll:
-            raise ValueError(f"missing milvus_collection in MinIO metadata for job_id={j}")
+            raise ValueError(
+                f"missing milvus_collection in MinIO metadata for job_id={j}"
+            )
         groups.setdefault(coll, []).append(j)
         metas[j] = meta
     all_rows: List[dict] = []
     for coll, jids_in in groups.items():
         m0 = metas.get(jids_in[0], {})
-        idx_t = (index_type_default or "").strip() or str(m0.get("milvus_index_type", "AUTOINDEX"))
+        idx_t = (index_type_default or "").strip() or str(
+            m0.get("milvus_index_type", "AUTOINDEX")
+        )
         mtype = str(m0.get("milvus_metric_type", "COSINE") or "COSINE")
         sc = MilvusSearchConfig(
             metric_type=mtype,
@@ -272,6 +292,7 @@ def _milvus_search_multi_jobs(
             index_type=str(idx_t or "AUTOINDEX").strip(),
             search_config=sc,
             collection_name=coll,
+            metadata_filter_expr=metadata_filter_expr,
         )
         all_rows.extend(part)
     all_rows.sort(key=lambda r: float(r.get("faiss_score", 0.0)))
@@ -413,8 +434,8 @@ def _render_qa_scroll_block(messages: List[dict[str, str]]) -> None:
         )
     body = "".join(rows) if rows else "<div style='opacity:0.7;'>No messages yet.</div>"
     html_block = (
-        "<div style=\"max-height:380px; overflow-y:auto; border:1px solid #ddd; "
-        "border-radius:12px; padding:10px; background:#fafafa;\">"
+        '<div style="max-height:380px; overflow-y:auto; border:1px solid #ddd; '
+        'border-radius:12px; padding:10px; background:#fafafa;">'
         f"{body}</div>"
     )
     components.html(html_block, height=410, scrolling=True)
@@ -462,11 +483,7 @@ def rewrite_query_with_llm(
             "parsed": out,
         }
         return (out, info) if debug else out
-    user_prompt = (
-        _rewrite_user_prompt(question)
-        + "\n\nHistory:\n"
-        + history
-    )
+    user_prompt = _rewrite_user_prompt(question) + "\n\nHistory:\n" + history
     prompt = _compose_chat_prompt(REWRITE_SYSTEM_PROMPT, user_prompt)
     raw = llm_generate_text(
         generator=generator,
@@ -503,11 +520,7 @@ def decompose_query_with_llm(
             "parsed": out,
         }
         return (out, info) if debug else out
-    user_prompt = (
-        _decompose_user_prompt(question)
-        + "\n\nHistory:\n"
-        + history
-    )
+    user_prompt = _decompose_user_prompt(question) + "\n\nHistory:\n" + history
     prompt = _compose_chat_prompt(DECOMPOSE_SYSTEM_PROMPT, user_prompt)
     raw = llm_generate_text(
         generator=generator,
@@ -602,14 +615,10 @@ def generate_filter_with_llm(
 
 def apply_keyword_filter(rows: List[dict], filt: dict, *, min_keep: int) -> List[dict]:
     include = [
-        t.lower()
-        for t in filt.get("include", [])
-        if isinstance(t, str) and t.strip()
+        t.lower() for t in filt.get("include", []) if isinstance(t, str) and t.strip()
     ]
     exclude = [
-        t.lower()
-        for t in filt.get("exclude", [])
-        if isinstance(t, str) and t.strip()
+        t.lower() for t in filt.get("exclude", []) if isinstance(t, str) and t.strip()
     ]
     if not include and not exclude:
         return rows
@@ -738,51 +747,41 @@ def _retrieve_rows_for_query(
     embedder: EmbeddingModel,
     corpus_chunks: List[str],
     faiss_index: FaissIndex,
+    config: RAGPipelineConfig,
     top_k: int,
-    vdb_backend: str = "faiss",
     milvus_store: Optional[MilvusChunkStore] = None,
-    milvus_job_id: Optional[str] = None,
-    milvus_job_ids: Optional[List[str]] = None,
-    milvus_collection: Optional[str] = None,
-    milvus_index_type: str = "AUTOINDEX",
-    milvus_search_config: Optional[MilvusSearchConfig] = None,
-    retrieval_mode: str = "dense",
     bm25_resources: Optional[BM25Resources] = None,
-    fusion_list_k: Optional[int] = None,
-    rrf_k: int = 60,
+    metadata_filter_expr: Optional[str] = None,
 ) -> List[dict]:
-    mids = [x.strip() for x in (milvus_job_ids or []) if x and str(x).strip()]
-    if (
-        vdb_backend == "milvus"
-        and milvus_store is not None
-        and len(mids) > 1
-        and milvus_search_config is not None
-    ):
-        return _milvus_search_multi_jobs(
-            mids,
-            query,
-            embedder,
-            milvus_store,
-            top_k,
-            milvus_index_type,
-            milvus_search_config,
-        )
-    if (
-        vdb_backend == "milvus"
-        and milvus_store is not None
-        and milvus_job_id
-    ):
+    r = config.retrieval
+    mctx = config.milvus
+    milvus_search_config = mctx.search_config()
+    mids = mctx.resolved_job_ids()
+    vdb_backend = r.vdb_backend
+    if vdb_backend == "milvus" and milvus_store is not None and mids:
+        if len(mids) > 1:
+            return _milvus_search_multi_jobs(
+                mids,
+                query,
+                embedder,
+                milvus_store,
+                top_k,
+                mctx.index_type,
+                milvus_search_config,
+                metadata_filter_expr=metadata_filter_expr,
+            )
         return milvus_store.search_job_chunks(
-            job_id=milvus_job_id,
+            job_id=mids[0],
             query=query,
             embedder=embedder,
             top_k=top_k,
             search_config=milvus_search_config,
-            index_type=milvus_index_type,
-            collection_name=milvus_collection,
+            index_type=mctx.index_type,
+            collection_name=mctx.collection,
+            metadata_filter_expr=metadata_filter_expr,
         )
     # FAISS backend: allow dense-only or hybrid BM25+dense (RRF).
-    if retrieval_mode == "hybrid" and bm25_resources is not None:
+    if r.mode == "hybrid" and bm25_resources is not None:
         idx_row = fused_top_indices(
             query,
             embedder=embedder,
@@ -790,8 +789,8 @@ def _retrieve_rows_for_query(
             faiss_index=faiss_index,
             bm25_resources=bm25_resources,
             retrieve_k=top_k,
-            rrf_k=int(rrf_k),
-            fusion_list_k=fusion_list_k,
+            rrf_k=int(r.rrf_k),
+            fusion_list_k=r.fusion_list_k,
         )
         rows: List[dict] = []
         for rank, ci in enumerate(idx_row, start=1):
@@ -837,51 +836,58 @@ def run_pipeline(
     embedder: EmbeddingModel,
     corpus_chunks: List[str],
     faiss_index: FaissIndex,
-    retrieve_k: int,
-    final_k: int,
-    use_rerank: bool,
-    reranker: Optional[Reranker],
-    prompt_template: str,
-    max_context_chars: int,
-    truncation: TruncationStrategy,
+    config: RAGPipelineConfig,
     generator: TextGenerator,
-    use_query_rewrite: bool = False,
-    use_query_decomposition: bool = False,
-    max_subqueries: int = 3,
-    use_filter_generation: bool = False,
-    min_filter_keep: int = 3,
-    use_reflection_loops: bool = False,
-    max_reflection_loops: int = 2,
-    require_citations: bool = False,
-    history: str = "None",
-    vdb_backend: str = "faiss",
+    reranker: Optional[Reranker],
     milvus_store: Optional[MilvusChunkStore] = None,
-    milvus_job_id: Optional[str] = None,
-    milvus_job_ids: Optional[List[str]] = None,
-    milvus_collection: Optional[str] = None,
-    milvus_index_type: str = "AUTOINDEX",
-    milvus_search_config: Optional[MilvusSearchConfig] = None,
-    semantic_cache: Optional[RedisSemanticCache] = None,
-    semantic_cache_threshold: float = 0.93,
-    semantic_cache_max_entries: int = 512,
-    retrieval_mode: str = "dense",
     bm25_resources: Optional[BM25Resources] = None,
-    fusion_list_k: Optional[int] = None,
-    rrf_k: int = 60,
+    semantic_cache: Optional[RedisSemanticCache] = None,
+    history: str = "None",
 ) -> dict:
-    mids = [x.strip() for x in (milvus_job_ids or []) if x and str(x).strip()]
-    if not mids and milvus_job_id and str(milvus_job_id).strip():
-        mids = [str(milvus_job_id).strip()]
+    feat = config.features
+    r = config.retrieval
+    mv = config.milvus
+    pc = config.prompt
+    scf = config.semantic_cache
+    meta = config.metadata
+    mids = mv.resolved_job_ids()
+    milvus_search_config = mv.search_config()
     use_milvus_vec = bool(
-        vdb_backend == "milvus"
+        r.vdb_backend == "milvus"
         and milvus_store is not None
         and len(mids) >= 1
         and milvus_search_config is not None
     )
     if use_milvus_vec:
-        k = retrieve_k
+        k = r.retrieve_k
     else:
-        k = min(retrieve_k, len(corpus_chunks))
+        k = min(r.retrieve_k, len(corpus_chunks))
+    prompt_template = PROMPT_TEMPLATES.get(pc.template_key, PROMPT_TEMPLATES["default"])
+    max_context_chars = int(pc.max_context_chars)
+    truncation = pc.truncation  # type: ignore[assignment]
+    retrieve_k = r.retrieve_k
+    final_k = r.final_k
+    retrieval_mode = r.mode
+    milvus_collection = mv.collection
+    milvus_index_type = mv.index_type
+    fusion_list_k = r.fusion_list_k
+    rrf_k = r.rrf_k
+    vdb_backend = r.vdb_backend
+    use_query_rewrite = feat.use_query_rewrite
+    use_query_decomposition = feat.use_query_decomposition
+    max_subqueries = feat.max_subqueries
+    use_filter_generation = feat.use_filter_generation
+    min_filter_keep = feat.min_filter_keep
+    use_reflection_loops = feat.use_reflection_loops
+    max_reflection_loops = feat.max_reflection_loops
+    require_citations = feat.require_citations
+    use_rerank = feat.use_rerank
+    filter_doc_date_min = meta.doc_date_min
+    filter_doc_date_max = meta.doc_date_max
+    filter_source_type = meta.source_type
+    filter_section = meta.section
+    semantic_cache_threshold = float(scf.threshold)
+    semantic_cache_max_entries = int(scf.max_entries)
     llm_details = get_generator_details(generator)
     stage_trace: List[dict] = []
     stage_trace.append(
@@ -905,6 +911,11 @@ def run_pipeline(
                 "milvus_index_type": milvus_index_type,
                 "milvus_collection": milvus_collection,
                 "milvus_job_ids": mids if len(mids) > 1 else None,
+                "filter_doc_date_min": (filter_doc_date_min or "").strip() or None,
+                "filter_doc_date_max": (filter_doc_date_max or "").strip() or None,
+                "filter_source_type": (filter_source_type or "").strip() or None,
+                "filter_section": (filter_section or "").strip() or None,
+                "config_source": "RAGPipelineConfig",
             },
         }
     )
@@ -918,6 +929,33 @@ def run_pipeline(
             "answer": "",
             "raw_context": "",
         }
+
+    metadata_filter_expr: Optional[str] = None
+    if any(
+        (
+            (filter_doc_date_min or "").strip(),
+            (filter_doc_date_max or "").strip(),
+            (filter_source_type or "").strip(),
+            (filter_section or "").strip(),
+        )
+    ):
+        try:
+            metadata_filter_expr = metadata_filter_to_milvus_expr(
+                doc_date_min=filter_doc_date_min,
+                doc_date_max=filter_doc_date_max,
+                source_type=filter_source_type,
+                section=filter_section,
+            )
+        except ValueError as e:
+            return {
+                "error": f"metadata filter: {e}",
+                "retrieved": [],
+                "rerank_rows": [],
+                "final_passages": [],
+                "prompt": "",
+                "answer": "",
+                "raw_context": "",
+            }
 
     t_all = perf_counter()
     stage_latencies: Dict[str, float] = {}
@@ -999,26 +1037,17 @@ def run_pipeline(
 
     t_stage = perf_counter()
     merged: Dict[Any, dict] = {}
-    _pass_milvus_ids = mids if len(mids) > 1 else None
-    _pass_milvus_job = mids[0] if len(mids) == 1 else milvus_job_id
     for rq in retrieval_queries:
         rows = _retrieve_rows_for_query(
             rq,
             embedder=embedder,
             corpus_chunks=corpus_chunks,
             faiss_index=faiss_index,
+            config=config,
             top_k=k,
-            vdb_backend=vdb_backend,
             milvus_store=milvus_store,
-            milvus_job_id=_pass_milvus_job,
-            milvus_job_ids=_pass_milvus_ids,
-            milvus_collection=milvus_collection,
-            milvus_index_type=milvus_index_type,
-            milvus_search_config=milvus_search_config,
-            retrieval_mode=retrieval_mode,
             bm25_resources=bm25_resources,
-            fusion_list_k=fusion_list_k,
-            rrf_k=rrf_k,
+            metadata_filter_expr=metadata_filter_expr,
         )
         for row in rows:
             mk = _retrieval_merge_key(row)
@@ -1034,8 +1063,12 @@ def run_pipeline(
                 }
             else:
                 cur = merged[mk]
-                cur["faiss_score"] = max(float(cur["faiss_score"]), float(row["faiss_score"]))
-                cur["best_faiss_rank"] = min(int(cur["best_faiss_rank"]), int(row["faiss_rank"]))
+                cur["faiss_score"] = max(
+                    float(cur["faiss_score"]), float(row["faiss_score"])
+                )
+                cur["best_faiss_rank"] = min(
+                    int(cur["best_faiss_rank"]), int(row["faiss_rank"])
+                )
                 if rq not in cur["matched_queries"]:
                     cur["matched_queries"].append(rq)
 
@@ -1119,7 +1152,9 @@ def run_pipeline(
     t_stage = perf_counter()
     if use_rerank and reranker is not None and pool:
         rerank_rows = cross_encoder_rerank_trace(reranker, rewritten_question, pool)
-        final_passages = [r["text"] for r in rerank_rows[: min(final_k, len(rerank_rows))]]
+        final_passages = [
+            r["text"] for r in rerank_rows[: min(final_k, len(rerank_rows))]
+        ]
     else:
         final_passages = pool[: min(final_k, len(pool))]
     stage_latencies["rerank_ms"] = (perf_counter() - t_stage) * 1000.0
@@ -1278,18 +1313,11 @@ def run_pipeline(
                 embedder=embedder,
                 corpus_chunks=corpus_chunks,
                 faiss_index=faiss_index,
+                config=config,
                 top_k=k,
-                vdb_backend=vdb_backend,
                 milvus_store=milvus_store,
-                milvus_job_id=_pass_milvus_job,
-                milvus_job_ids=_pass_milvus_ids,
-                milvus_collection=milvus_collection,
-                milvus_index_type=milvus_index_type,
-                milvus_search_config=milvus_search_config,
-                retrieval_mode=retrieval_mode,
                 bm25_resources=bm25_resources,
-                fusion_list_k=fusion_list_k,
-                rrf_k=rrf_k,
+                metadata_filter_expr=metadata_filter_expr,
             )
             added = 0
             for row in new_rows:
@@ -1333,7 +1361,9 @@ def run_pipeline(
             pool = [r["text"] for r in retrieved]
 
             if use_rerank and reranker is not None and pool:
-                rerank_rows = cross_encoder_rerank_trace(reranker, rewritten_question, pool)
+                rerank_rows = cross_encoder_rerank_trace(
+                    reranker, rewritten_question, pool
+                )
                 final_passages = [
                     r["text"] for r in rerank_rows[: min(final_k, len(rerank_rows))]
                 ]
@@ -1475,15 +1505,23 @@ def run_pipeline(
 def render_rag_trace(result: dict, *, ui_id: int, final_k: int) -> None:
     fk = int(final_k)
     tab_chunks, tab_rerank, tab_prompt = st.tabs(
-        ["Retrieved chunks (vector search)", "Reranking (cross-encoder)", "Final prompt & answer"]
+        [
+            "Retrieved chunks (vector search)",
+            "Reranking (cross-encoder)",
+            "Final prompt & answer",
+        ]
     )
 
     with tab_chunks:
         mode = result.get("retrieval_mode", "dense")
         if mode == "hybrid":
             st.caption("Retrieval mode: **Hybrid BM25 + dense (RRF fusion)**.")
-        if result.get("rewritten_question") and result.get("rewritten_question") != result.get("original_question"):
-            st.caption(f"Query rewrite: `{result['original_question']}` → `{result['rewritten_question']}`")
+        if result.get("rewritten_question") and result.get(
+            "rewritten_question"
+        ) != result.get("original_question"):
+            st.caption(
+                f"Query rewrite: `{result['original_question']}` → `{result['rewritten_question']}`"
+            )
         queries = result.get("retrieval_queries", [])
         if len(queries) > 1:
             st.caption(f"Query decomposition used {len(queries)} retrieval queries.")
@@ -1517,7 +1555,9 @@ def render_rag_trace(result: dict, *, ui_id: int, final_k: int) -> None:
             st.warning("Empty pool.")
         else:
             for row in result["rerank_rows"]:
-                with st.expander(f"CE rank {row['new_rank']} (was retrieval #{row['faiss_rank']}) · {row['cross_encoder_score']:.4f}"):
+                with st.expander(
+                    f"CE rank {row['new_rank']} (was retrieval #{row['faiss_rank']}) · {row['cross_encoder_score']:.4f}"
+                ):
                     st.text_area(
                         "Passage",
                         row["text"],
@@ -1525,7 +1565,9 @@ def render_rag_trace(result: dict, *, ui_id: int, final_k: int) -> None:
                         key=f"{ui_id}_r_{row['new_rank']}",
                         label_visibility="collapsed",
                     )
-            st.caption(f"Passages 1–{min(fk, len(result['rerank_rows']))} → LLM context.")
+            st.caption(
+                f"Passages 1–{min(fk, len(result['rerank_rows']))} → LLM context."
+            )
 
     with tab_prompt:
         if result.get("cache_hit"):
@@ -1598,7 +1640,9 @@ def render_ragas_metrics_block(result: dict) -> None:
     if lr == "mock":
         lr = "gemini"
     if "ragas_eval_backend" not in st.session_state:
-        st.session_state.ragas_eval_backend = lr if lr in ("gemini", "openai", "ollama") else "gemini"
+        st.session_state.ragas_eval_backend = (
+            lr if lr in ("gemini", "openai", "ollama") else "gemini"
+        )
 
     with st.expander(
         "RAGAS scores (context precision · faithfulness · answer correctness)",
@@ -1661,11 +1705,7 @@ def render_ragas_metrics_block(result: dict) -> None:
 
         scores = st.session_state.get("last_ragas_scores")
         ver = st.session_state.get("ragas_scores_ui_version")
-        if (
-            scores
-            and ver is not None
-            and int(ver) == current_ui
-        ):
+        if scores and ver is not None and int(ver) == current_ui:
             if scores.get("error"):
                 st.error(scores["error"])
             else:
@@ -1740,7 +1780,9 @@ def render_stage_trace(result: dict) -> None:
     if not stages:
         return
     st.subheader("Query process trace")
-    st.caption("Click each stage to inspect input/output. Titles include **latency_ms** when available.")
+    st.caption(
+        "Click each stage to inspect input/output. Titles include **latency_ms** when available."
+    )
     for i, stg in enumerate(stages, start=1):
         title = stg.get("title") or stg.get("stage") or f"Stage {i}"
         lm = stg.get("latency_ms")
@@ -1906,7 +1948,9 @@ def _ui_benchmark() -> None:
         )
         flat = _runs_leaderboard_frame(df_runs)
         if flat.empty:
-            st.info("No runs yet. Run **exp_rag_generation.py** or enable logging on the **Query** page.")
+            st.info(
+                "No runs yet. Run **exp_rag_generation.py** or enable logging on the **Query** page."
+            )
         else:
             show_cols = [
                 c
@@ -1963,7 +2007,9 @@ def _ui_benchmark() -> None:
                     {
                         "latency_ms": xf,
                         "accuracy_y": yf,
-                        "score_kind": "RAGAS composite" if y_r is not None else "Token F1",
+                        "score_kind": (
+                            "RAGAS composite" if y_r is not None else "Token F1"
+                        ),
                         "label": label[:80],
                         "rerank": "rerank on" if rr else "rerank off",
                     }
@@ -1985,7 +2031,9 @@ def _ui_benchmark() -> None:
                 fig.update_layout(height=520)
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                st.info("Need runs with both **latency_ms** and **token_f1** or **ragas_composite** to plot.")
+                st.info(
+                    "Need runs with both **latency_ms** and **token_f1** or **ragas_composite** to plot."
+                )
 
     with tab_fail:
         st.subheader("Bad-case review")
@@ -2000,7 +2048,9 @@ def _ui_benchmark() -> None:
             )
             df_fail = df_fail[mask]
         if df_fail.empty:
-            st.info("No failed queries logged yet (or no reference / metrics captured).")
+            st.info(
+                "No failed queries logged yet (or no reference / metrics captured)."
+            )
         else:
             ids = [int(x) for x in df_fail["id"].tolist()]
             pick = st.selectbox("Select query id", ids, format_func=lambda i: f"#{i}")
@@ -2008,7 +2058,13 @@ def _ui_benchmark() -> None:
             q1, q2, q3 = st.columns(3)
             with q1:
                 st.markdown("**User query**")
-                st.text_area("q", str(row.get("question") or ""), height=220, key="bad_q", label_visibility="collapsed")
+                st.text_area(
+                    "q",
+                    str(row.get("question") or ""),
+                    height=220,
+                    key="bad_q",
+                    label_visibility="collapsed",
+                )
             with q2:
                 st.markdown("**Retrieved chunks (final context)**")
                 chunks = _safe_json_loads(row.get("retrieved_chunks_json"))
@@ -2016,10 +2072,18 @@ def _ui_benchmark() -> None:
                     blob = "\n\n---\n\n".join(str(c) for c in chunks)
                 else:
                     blob = str(chunks)
-                st.text_area("ctx", blob, height=220, key="bad_ctx", label_visibility="collapsed")
+                st.text_area(
+                    "ctx", blob, height=220, key="bad_ctx", label_visibility="collapsed"
+                )
             with q3:
                 st.markdown("**LLM output**")
-                st.text_area("out", str(row.get("llm_output") or ""), height=220, key="bad_out", label_visibility="collapsed")
+                st.text_area(
+                    "out",
+                    str(row.get("llm_output") or ""),
+                    height=220,
+                    key="bad_out",
+                    label_visibility="collapsed",
+                )
             st.caption(
                 f"gold_hit={row.get('gold_hit')} · token_f1={row.get('token_f1')} · "
                 f"latency_ms={row.get('latency_ms')} · tokens={row.get('token_count')}"
@@ -2048,8 +2112,12 @@ def _ui_benchmark() -> None:
             "Rates default to **Gemini 2.5 Flash** (~$0.30 / $2.50 per 1M tok) and **GLM-4.5-class** (~$0.60 / $2.20 per 1M tok on Z.AI). "
             "Adjust FX and split to match your billing."
         )
-        fx = st.number_input("USD → CNY", min_value=0.01, value=7.20, step=0.05, format="%.2f")
-        in_frac = st.slider("Assumed share of tokens that are prompt (input)", 0.0, 1.0, 0.72, 0.01)
+        fx = st.number_input(
+            "USD → CNY", min_value=0.01, value=7.20, step=0.05, format="%.2f"
+        )
+        in_frac = st.slider(
+            "Assumed share of tokens that are prompt (input)", 0.0, 1.0, 0.72, 0.01
+        )
         out_frac = max(0.0, 1.0 - in_frac)
         gem_in = GEMINI_25_FLASH_USD_PER_1M[0] * fx
         gem_out = GEMINI_25_FLASH_USD_PER_1M[1] * fx
@@ -2078,7 +2146,11 @@ def _ui_benchmark() -> None:
             "Redis: live pipeline status (``ingest:job:{{id}}``). "
             "MinIO: persisted artifact index (same as **Library**)."
         )
-        jid = st.text_input("Job ID", value=st.session_state.get("last_job_id", ""), key="bench_redis_jid")
+        jid = st.text_input(
+            "Job ID",
+            value=st.session_state.get("last_job_id", ""),
+            key="bench_redis_jid",
+        )
         if st.button("Fetch Redis status", key="bench_redis_btn"):
             if not (jid or "").strip():
                 st.warning("Enter a job id.")
@@ -2127,7 +2199,9 @@ def load_job(job_id: str) -> None:
     st.session_state.source_label = f"{job_id.strip()} · {fn}"
     st.session_state.loaded_job_id = job_id.strip()
     st.session_state.loaded_job_ids = [job_id.strip()]
-    st.session_state.loaded_milvus_collection = str(meta.get("milvus_collection") or "").strip() or None
+    st.session_state.loaded_milvus_collection = (
+        str(meta.get("milvus_collection") or "").strip() or None
+    )
     st.session_state.last_job_id = job_id.strip()
     st.session_state.pop("last_rag", None)
     st.session_state.pop("last_question", None)
@@ -2256,7 +2330,9 @@ def _sidebar_nav() -> str:
 
 
 def main() -> None:
-    st.set_page_config(page_title="RAG Lab", layout="wide", initial_sidebar_state="expanded")
+    st.set_page_config(
+        page_title="RAG Lab", layout="wide", initial_sidebar_state="expanded"
+    )
     _init_session()
     if not st.session_state.get("_prometheus_http_started"):
         try:
@@ -2289,7 +2365,9 @@ def main() -> None:
 
 
 def _ui_ingest_pipeline() -> None:
-    st.caption("Upload → filter → extract → chunk & summarize → embed/upsert (**Milvus**) → **MinIO** + **Redis**")
+    st.caption(
+        "Upload → filter → extract → chunk & summarize → embed/upsert (**Milvus**) → **MinIO** + **Redis**"
+    )
 
     st.subheader("1 — Upload & page filter")
     up_col, filt_col = st.columns(2)
@@ -2321,6 +2399,21 @@ def _ui_ingest_pipeline() -> None:
     )
 
     st.subheader("3 — Chunking & summarization")
+    md1, md2 = st.columns(2)
+    with md1:
+        ingest_doc_date = st.text_input(
+            "Document date (optional, YYYY-MM-DD)",
+            value="",
+            key="ing_doc_date",
+            help="Stored per chunk as Milvus `doc_date`. Overrides PDF metadata when set.",
+        )
+    with md2:
+        ingest_doc_section = st.text_input(
+            "Section label",
+            value="document",
+            key="ing_doc_section",
+            help='Logical section for all chunks (flat ingest), e.g. "document" or "methods".',
+        )
     c1, c2, c3 = st.columns(3)
     with c1:
         chunk_size = st.number_input(
@@ -2358,7 +2451,9 @@ def _ui_ingest_pipeline() -> None:
             index=1,
             help="Preset fills sensible defaults; choose custom to tune each option manually.",
         )
-        pvals = _milvus_preset_values(ingest_preset if ingest_preset != "custom" else "balanced")
+        pvals = _milvus_preset_values(
+            ingest_preset if ingest_preset != "custom" else "balanced"
+        )
         mi1, mi2, mi3 = st.columns(3)
         with mi1:
             milvus_index_type = st.selectbox(
@@ -2417,23 +2512,30 @@ def _ui_ingest_pipeline() -> None:
             st.error("Upload at least one document first.")
         else:
             try:
-                cfg = IngestPipelineConfig(
-                    chunk_size=int(chunk_size),
-                    chunk_overlap=int(chunk_overlap),
-                    extraction=extraction,  # type: ignore[arg-type]
-                    summarization=strat,  # type: ignore[arg-type]
-                    milvus_index_type=str(milvus_index_type),
-                    milvus_metric_type=str(milvus_metric_type),
-                    milvus_ivf_nlist=int(milvus_ivf_nlist),
-                    milvus_hnsw_m=int(milvus_hnsw_m),
-                    milvus_hnsw_ef_construction=int(milvus_hnsw_ef_construction),
-                    milvus_upsert_batch_size=int(milvus_upsert_batch_size),
-                )
+                cfg = merge_ingest_with_dict(
+                    load_ingest_config(),
+                    {
+                        "chunk_size": int(chunk_size),
+                        "chunk_overlap": int(chunk_overlap),
+                        "extraction": extraction,
+                        "summarization": strat,
+                        "milvus_index_type": str(milvus_index_type),
+                        "milvus_metric_type": str(milvus_metric_type),
+                        "milvus_ivf_nlist": int(milvus_ivf_nlist),
+                        "milvus_hnsw_m": int(milvus_hnsw_m),
+                        "milvus_hnsw_ef_construction": int(milvus_hnsw_ef_construction),
+                        "milvus_upsert_batch_size": int(milvus_upsert_batch_size),
+                        "doc_date": (ingest_doc_date or "").strip() or None,
+                        "doc_section": (ingest_doc_section or "").strip(),
+                    },
+                ).to_pipeline_dataclass()
                 summ = ingest_summarizer(summ_backend) if strat != "single" else None
                 successes: List[dict[str, Any]] = []
                 failures: List[dict[str, str]] = []
                 total = len(uploaded_files)
-                progress_bar = st.progress(0.0, text=f"Starting ingest for {total} file(s)…")
+                progress_bar = st.progress(
+                    0.0, text=f"Starting ingest for {total} file(s)…"
+                )
                 status_box = st.empty()
                 for i, up in enumerate(uploaded_files, start=1):
                     status_box.info(f"Running pipeline ({i}/{total}): {up.name}")
@@ -2493,7 +2595,9 @@ def _ui_ingest_pipeline() -> None:
 def _ui_library() -> None:
     st.caption("Jobs stored in MinIO (prefix = **job_id**).")
     if st.button("Refresh list"):
-        st.session_state.library_refresh = st.session_state.get("library_refresh", 0) + 1
+        st.session_state.library_refresh = (
+            st.session_state.get("library_refresh", 0) + 1
+        )
 
     try:
         rows = _minio_store().list_ingest_jobs_table()
@@ -2516,7 +2620,9 @@ def _ui_library() -> None:
             "embedding_model": st.column_config.TextColumn("embedding"),
             "summarization": st.column_config.TextColumn("summary strat"),
             "extraction": st.column_config.TextColumn("extraction"),
-            "milvus_collection": st.column_config.TextColumn("milvus collection", width="large"),
+            "milvus_collection": st.column_config.TextColumn(
+                "milvus collection", width="large"
+            ),
             "milvus_index_type": st.column_config.TextColumn("index"),
             "milvus_metric_type": st.column_config.TextColumn("metric"),
         },
@@ -2603,14 +2709,18 @@ def _ui_query() -> None:
                 f"Loaded **{len(_lj)} jobs** — {len(st.session_state.corpus_chunks)} chunks total · "
                 f"{st.session_state.source_label}"
             )
-            st.caption("Queries use **combined Milvus retrieval** across the selected jobs.")
+            st.caption(
+                "Queries use **combined Milvus retrieval** across the selected jobs."
+            )
         else:
             st.success(
                 f"Loaded **{st.session_state.loaded_job_id}** — "
                 f"{len(st.session_state.corpus_chunks)} chunks · {st.session_state.source_label}"
             )
             if st.session_state.get("loaded_milvus_collection"):
-                st.caption(f"Milvus collection loaded: `{st.session_state.loaded_milvus_collection}`")
+                st.caption(
+                    f"Milvus collection loaded: `{st.session_state.loaded_milvus_collection}`"
+                )
     else:
         st.warning("No job loaded.")
 
@@ -2672,6 +2782,11 @@ def _ui_query() -> None:
     default_milvus_metric_type = str(ingest_meta.get("milvus_metric_type", "COSINE"))
     query_preset_default = "balanced"
 
+    filter_doc_date_min_ui = ""
+    filter_doc_date_max_ui = ""
+    filter_source_type_ui = ""
+    filter_section_ui = ""
+
     chat_bar_options_col, _ = st.columns([1, 6])
     with chat_bar_options_col:
         with st.popover("Options", disabled=not ready):
@@ -2682,11 +2797,15 @@ def _ui_query() -> None:
             query_preset = st.selectbox(
                 "Milvus search preset",
                 ["fast", "balanced", "high_recall", "custom"],
-                index=["fast", "balanced", "high_recall", "custom"].index(query_preset_default),
+                index=["fast", "balanced", "high_recall", "custom"].index(
+                    query_preset_default
+                ),
                 disabled=not ready,
                 help="Preset sets query-time ANN params. Custom lets you override manually.",
             )
-            qvals = _milvus_preset_values(query_preset if query_preset != "custom" else "balanced")
+            qvals = _milvus_preset_values(
+                query_preset if query_preset != "custom" else "balanced"
+            )
             milvus_index_type = (
                 default_milvus_index_type
                 if default_milvus_index_type in MILVUS_INDEX_TYPES
@@ -2723,7 +2842,9 @@ def _ui_query() -> None:
                 if st.button("Show active Milvus index config", disabled=not ready):
                     try:
                         info = _milvus_store().describe_collection(
-                            collection_name=st.session_state.get("loaded_milvus_collection")
+                            collection_name=st.session_state.get(
+                                "loaded_milvus_collection"
+                            )
                         )
                         st.json(info)
                     except Exception as e:
@@ -2745,6 +2866,34 @@ def _ui_query() -> None:
                 5,
                 disabled=True,
                 help="RRF smoothing constant; larger values flatten rank contribution.",
+            )
+            st.divider()
+            st.caption(
+                "Metadata filters (same fields as ``POST /v1/rag/query`` ``filter_*``)"
+            )
+            filter_doc_date_min_ui = st.text_input(
+                "filter_doc_date_min",
+                value="",
+                disabled=not ready,
+                help="ISO date YYYY-MM-DD — lower bound on stored ``doc_date`` (excludes ``unknown``).",
+            )
+            filter_doc_date_max_ui = st.text_input(
+                "filter_doc_date_max",
+                value="",
+                disabled=not ready,
+                help="ISO date YYYY-MM-DD — upper bound on stored ``doc_date``.",
+            )
+            filter_source_type_ui = st.text_input(
+                "filter_source_type",
+                value="",
+                disabled=not ready,
+                help="Exact match, e.g. pdf, txt, md (from ingest filename).",
+            )
+            filter_section_ui = st.text_input(
+                "filter_section",
+                value="",
+                disabled=not ready,
+                help='Exact section label (ingest default is usually "document").',
             )
             retrieve_k = st.slider(
                 "Retrieval top-K",
@@ -2916,6 +3065,10 @@ def _ui_query() -> None:
         max_context_chars = 6000
         truncation = "head"
         backend = "mock"
+        filter_doc_date_min_ui = ""
+        filter_doc_date_max_ui = ""
+        filter_source_type_ui = ""
+        filter_section_ui = ""
 
     if not ready:
         st.info("Attach a job and click **Load** to enable questions.")
@@ -2926,7 +3079,9 @@ def _ui_query() -> None:
         st.caption(
             "Appends to **results/experiment_db.sqlite** for the **Benchmark** leaderboard, cost view, and bad-case review."
         )
-        st.checkbox("Log each query to the experiment DB", value=True, key="exp_log_queries")
+        st.checkbox(
+            "Log each query to the experiment DB", value=True, key="exp_log_queries"
+        )
         st.text_area(
             "Reference answer (optional — enables token F1, gold hit, and failure filters)",
             key="exp_reference_answer",
@@ -2955,11 +3110,6 @@ def _ui_query() -> None:
     if question and question.strip():
         embedder = cached_embedder(DEFAULT_EMBED)
         reranker = cached_reranker(DEFAULT_RERANK) if use_rerank else None
-        milvus_search_config = MilvusSearchConfig(
-            metric_type=str(milvus_metric_type),
-            ivf_nprobe=int(milvus_ivf_nprobe),
-            hnsw_ef=int(milvus_hnsw_ef),
-        )
         try:
             gen = make_generator(backend)
         except Exception as e:
@@ -2989,7 +3139,9 @@ def _ui_query() -> None:
         elif use_semantic_cache and len(_loaded_ids) > 1:
             st.caption("Semantic cache off when multiple jobs are loaded.")
         hist = (
-            _history_to_text(st.session_state.get("query_history", []), max_turns=int(history_turns))
+            _history_to_text(
+                st.session_state.get("query_history", []), max_turns=int(history_turns)
+            )
             if use_session_history
             else "None"
         )
@@ -2999,43 +3151,68 @@ def _ui_query() -> None:
                 bm25_resources = build_bm25_resources(st.session_state.corpus_chunks)
 
         with st.spinner("Retrieving & generating…"):
+            pipe_cfg = RAGPipelineConfig(
+                retrieval=RetrievalConfig(
+                    retrieve_k=int(retrieve_k),
+                    final_k=int(final_k),
+                    mode=retrieval_mode,  # type: ignore[arg-type]
+                    fusion_list_k=int(fusion_list_k),
+                    rrf_k=int(rrf_k),
+                    vdb_backend=vdb_backend,  # type: ignore[arg-type]
+                ),
+                milvus=MilvusRuntimeConfig(
+                    job_id=st.session_state.loaded_job_id,
+                    job_ids=_loaded_ids if len(_loaded_ids) > 1 else None,
+                    collection=(
+                        None
+                        if len(_loaded_ids) > 1
+                        else st.session_state.get("loaded_milvus_collection")
+                    ),
+                    index_type=str(milvus_index_type),
+                    metric_type=str(milvus_metric_type),
+                    ivf_nprobe=int(milvus_ivf_nprobe),
+                    hnsw_ef=int(milvus_hnsw_ef),
+                ),
+                metadata=MetadataFilterConfig(
+                    doc_date_min=(filter_doc_date_min_ui or "").strip() or None,
+                    doc_date_max=(filter_doc_date_max_ui or "").strip() or None,
+                    source_type=(filter_source_type_ui or "").strip() or None,
+                    section=(filter_section_ui or "").strip() or None,
+                ),
+                features=PipelineFeaturesConfig(
+                    use_query_rewrite=use_query_rewrite,
+                    use_query_decomposition=use_query_decomposition,
+                    max_subqueries=int(max_subqueries),
+                    use_filter_generation=use_filter_generation,
+                    min_filter_keep=int(min_filter_keep),
+                    use_reflection_loops=use_reflection_loops,
+                    max_reflection_loops=int(max_reflection_loops),
+                    require_citations=require_citations,
+                    use_rerank=use_rerank,
+                ),
+                prompt=PromptConfig(
+                    template_key=template_key,
+                    max_context_chars=int(max_context_chars),
+                    truncation=str(truncation),  # type: ignore[arg-type]
+                ),
+                semantic_cache=SemanticCacheConfig(
+                    enabled=bool(semantic_cache is not None and use_semantic_cache),
+                    threshold=float(semantic_cache_threshold),
+                    max_entries=512,
+                ),
+            )
             result = run_pipeline(
                 question.strip(),
                 embedder=embedder,
                 corpus_chunks=st.session_state.corpus_chunks,
                 faiss_index=st.session_state.faiss_index,
-                retrieve_k=retrieve_k,
-                final_k=final_k,
-                use_rerank=use_rerank,
-                reranker=reranker,
-                prompt_template=PROMPT_TEMPLATES[template_key],
-                max_context_chars=int(max_context_chars),
-                truncation=truncation,  # type: ignore[arg-type]
+                config=pipe_cfg,
                 generator=gen,
-                use_query_rewrite=use_query_rewrite,
-                use_query_decomposition=use_query_decomposition,
-                max_subqueries=int(max_subqueries),
-                use_filter_generation=use_filter_generation,
-                min_filter_keep=int(min_filter_keep),
-                use_reflection_loops=use_reflection_loops,
-                max_reflection_loops=int(max_reflection_loops),
-                require_citations=require_citations,
-                history=hist,
-                vdb_backend=vdb_backend,
+                reranker=reranker,
                 milvus_store=milvus_store,
-                milvus_job_id=st.session_state.loaded_job_id,
-                milvus_job_ids=(_loaded_ids if len(_loaded_ids) > 1 else None),
-                milvus_collection=(
-                    None if len(_loaded_ids) > 1 else st.session_state.get("loaded_milvus_collection")
-                ),
-                milvus_index_type=str(milvus_index_type),
-                milvus_search_config=milvus_search_config,
-                semantic_cache=semantic_cache,
-                semantic_cache_threshold=float(semantic_cache_threshold),
-                retrieval_mode=retrieval_mode,
                 bm25_resources=bm25_resources,
-                fusion_list_k=int(fusion_list_k),
-                rrf_k=int(rrf_k),
+                semantic_cache=semantic_cache,
+                history=hist,
             )
         if result.get("error"):
             st.error(result["error"])

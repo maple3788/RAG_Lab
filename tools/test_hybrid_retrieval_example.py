@@ -114,9 +114,7 @@ def _pool_has_gold(pool_texts: list[str], gold: str) -> bool:
     return any(gold in t for t in pool_texts)
 
 
-def _rank_of_gold(
-    ordered_indices: list[int], gold_index: int
-) -> int | None:
+def _rank_of_gold(ordered_indices: list[int], gold_index: int) -> int | None:
     if gold_index not in ordered_indices:
         return None
     return ordered_indices.index(gold_index) + 1
@@ -161,7 +159,9 @@ def run_case(
     scores = bm25_resources.bm25.get_scores(q_tokens)
     bm25_order = [int(i) for i in np.argsort(-np.asarray(scores, dtype=np.float64))]
 
-    print(f"Dense top-{retrieve_k}:", dense_order, "→", [labels[i] for i in dense_order])
+    print(
+        f"Dense top-{retrieve_k}:", dense_order, "→", [labels[i] for i in dense_order]
+    )
     print(f"BM25 order (full):", bm25_order, "→", [labels[i] for i in bm25_order])
     print(
         f"Hybrid top-{retrieve_k} (fusion_list_k={fusion_list_k}):",
@@ -169,8 +169,12 @@ def run_case(
         "→",
         [labels[i] for i in hybrid_indices],
     )
-    print(f"  gold substring in dense pool: {_pool_has_gold(dense_pool, GOLD_SUBSTRING)}")
-    print(f"  gold substring in hybrid pool: {_pool_has_gold(hybrid_pool, GOLD_SUBSTRING)}")
+    print(
+        f"  gold substring in dense pool: {_pool_has_gold(dense_pool, GOLD_SUBSTRING)}"
+    )
+    print(
+        f"  gold substring in hybrid pool: {_pool_has_gold(hybrid_pool, GOLD_SUBSTRING)}"
+    )
 
     dr = _rank_of_gold(dense_order, gold_index)
     hr = _rank_of_gold(hybrid_indices, gold_index)
@@ -184,7 +188,9 @@ def run_case(
     elif dr is not None and hr is not None and hr < dr:
         print("  → Hybrid improved gold rank vs dense-only.")
     elif dr is not None and hr is not None and hr == dr == 1:
-        print("  → Gold already top-1 for both (embedding + sparse agree on this corpus).")
+        print(
+            "  → Gold already top-1 for both (embedding + sparse agree on this corpus)."
+        )
     print()
 
 

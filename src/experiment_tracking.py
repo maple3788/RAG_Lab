@@ -201,7 +201,9 @@ def log_query_event(
         return int(cur.lastrowid)
 
 
-def update_query_feedback(query_id: int, feedback: str, path: Optional[Path] = None) -> None:
+def update_query_feedback(
+    query_id: int, feedback: str, path: Optional[Path] = None
+) -> None:
     p = path or get_db_path()
     with _connect(p) as conn:
         conn.execute(
@@ -304,9 +306,17 @@ def log_evaluation_batch(
             latency_ms=float(row.get("latency_total_ms") or 0.0),
             token_count=int(row.get("token_count") or 0),
             model_config=config,
-            gold_hit=float(row["gold_hit"]) if row.get("gold_hit") is not None else None,
-            token_f1=float(row["token_f1"]) if row.get("token_f1") is not None else None,
-            exact_match=float(row["exact_match"]) if row.get("exact_match") is not None else None,
+            gold_hit=(
+                float(row["gold_hit"]) if row.get("gold_hit") is not None else None
+            ),
+            token_f1=(
+                float(row["token_f1"]) if row.get("token_f1") is not None else None
+            ),
+            exact_match=(
+                float(row["exact_match"])
+                if row.get("exact_match") is not None
+                else None
+            ),
             run_id=run_id,
             path=path,
         )

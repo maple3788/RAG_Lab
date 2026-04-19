@@ -123,7 +123,11 @@ class OpenAICompatibleGenerator:
                 "Or use --llm-backend ollama (local) or Gemini with GEMINI_API_KEY."
             )
         base_url = os.environ.get("OPENAI_BASE_URL")
-        self._client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
+        self._client = (
+            OpenAI(api_key=api_key, base_url=base_url)
+            if base_url
+            else OpenAI(api_key=api_key)
+        )
 
     def generate(self, prompt: str) -> str:
         resp = self._client.chat.completions.create(
@@ -204,7 +208,11 @@ class OllamaGenerator:
         from openai import OpenAI
 
         _load_project_dotenv()
-        base = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1").strip().rstrip("/")
+        base = (
+            os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1")
+            .strip()
+            .rstrip("/")
+        )
         if not base.endswith("/v1"):
             base = f"{base}/v1"
         self._client = OpenAI(

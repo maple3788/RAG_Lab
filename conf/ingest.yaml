@@ -1,0 +1,16 @@
+# Defaults for document ingest (OmegaConf → IngestSettings → IngestPipelineConfig).
+
+chunk_size: 512
+chunk_overlap: 64
+embedding_model: BAAI/bge-base-en-v1.5
+extraction: shallow
+summarization: single
+llm_min_interval_seconds: 0.75
+milvus_index_type: AUTOINDEX
+milvus_metric_type: COSINE
+milvus_ivf_nlist: 1024
+milvus_hnsw_m: 16
+milvus_hnsw_ef_construction: 200
+milvus_upsert_batch_size: 256
+doc_date: null
+doc_section: document

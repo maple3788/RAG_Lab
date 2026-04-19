@@ -82,4 +82,3 @@ def load_financebench_open_source(
             )
         )
     return examples
-

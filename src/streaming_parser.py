@@ -76,4 +76,3 @@ def strip_hidden_reasoning_text(text: str) -> str:
     visible = parser.feed(text or "")
     visible += parser.flush()
     return visible.strip()
-

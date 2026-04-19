@@ -48,14 +48,17 @@ def _make_ragas_eval_stack(args):
 
     eval_backend = args.ragas_eval_backend or args.llm_backend
     eval_model = args.ragas_eval_model or args.llm_model
-    embed_model = (
-        args.ragas_embed_model
-        or ("nomic-embed-text" if eval_backend == "ollama" else "text-embedding-3-small")
+    embed_model = args.ragas_embed_model or (
+        "nomic-embed-text" if eval_backend == "ollama" else "text-embedding-3-small"
     )
     use_eval_embeddings = not bool(args.no_ragas_embeddings)
 
     if eval_backend == "ollama":
-        base = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1").strip().rstrip("/")
+        base = (
+            os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1")
+            .strip()
+            .rstrip("/")
+        )
         if not base.endswith("/v1"):
             base = f"{base}/v1"
         lc_llm = ChatOpenAI(
@@ -106,7 +109,9 @@ def _make_ragas_eval_stack(args):
         api_key = os.environ.get("OPENAI_API_KEY")
         base_url = os.environ.get("OPENAI_BASE_URL")
         if not api_key:
-            raise SystemExit("OPENAI_API_KEY is required for non-ollama RAGAS evaluator.")
+            raise SystemExit(
+                "OPENAI_API_KEY is required for non-ollama RAGAS evaluator."
+            )
         lc_llm = ChatOpenAI(
             model=eval_model,
             api_key=api_key,
@@ -177,7 +182,9 @@ def _predict_examples(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="RAGAS evaluation on local QA JSONL.")
-    parser.add_argument("--data-path", type=Path, default=ROOT / "datasets" / "qa_dataset.jsonl")
+    parser.add_argument(
+        "--data-path", type=Path, default=ROOT / "datasets" / "qa_dataset.jsonl"
+    )
     parser.add_argument("--out-dir", type=Path, default=ROOT / "results")
     parser.add_argument("--max-examples", type=int, default=100)
     parser.add_argument("--embedding-model", default="BAAI/bge-base-en-v1.5")
@@ -186,7 +193,9 @@ def main() -> None:
     parser.add_argument("--retrieve-k", type=int, default=10)
     parser.add_argument("--final-k", type=int, default=3)
     parser.add_argument("--max-context-chars", type=int, default=6000)
-    parser.add_argument("--truncation", default="head", choices=("head", "tail", "middle"))
+    parser.add_argument(
+        "--truncation", default="head", choices=("head", "tail", "middle")
+    )
     parser.add_argument(
         "--prompt-template",
         default="default",
@@ -235,12 +244,18 @@ def main() -> None:
     # For local Ollama evaluator runs, provide OpenAI-compatible env defaults.
     if eval_backend == "ollama":
         os.environ.setdefault("OPENAI_API_KEY", "ollama")
-        base = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1").strip().rstrip("/")
+        base = (
+            os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1")
+            .strip()
+            .rstrip("/")
+        )
         if not base.endswith("/v1"):
             base = f"{base}/v1"
         os.environ.setdefault("OPENAI_BASE_URL", base)
         os.environ.setdefault("OPENAI_MODEL", args.ragas_eval_model or args.llm_model)
-        os.environ.setdefault("OPENAI_EMBEDDING_MODEL", args.ragas_embed_model or "nomic-embed-text")
+        os.environ.setdefault(
+            "OPENAI_EMBEDDING_MODEL", args.ragas_embed_model or "nomic-embed-text"
+        )
 
     try:
         from datasets import Dataset
@@ -308,7 +323,12 @@ def main() -> None:
     else:
         score_df = pd.DataFrame([dict(result)])
 
-    metric_cols = ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]
+    metric_cols = [
+        "faithfulness",
+        "answer_relevancy",
+        "context_precision",
+        "context_recall",
+    ]
     present = [c for c in metric_cols if c in score_df.columns]
     if present and score_df[present].isna().all().all():
         raise SystemExit(
@@ -324,4 +344,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

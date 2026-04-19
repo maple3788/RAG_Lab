@@ -1,0 +1,46 @@
+# Defaults for Streamlit / CLI RAG pipeline (merged via OmegaConf → Pydantic).
+# Override at runtime with RAGPipelineConfig.model_copy(...) or Hydra-style CLI later.
+
+retrieval:
+  retrieve_k: 10
+  final_k: 3
+  mode: dense
+  fusion_list_k: 30
+  rrf_k: 60
+  vdb_backend: milvus
+
+milvus:
+  index_type: AUTOINDEX
+  metric_type: COSINE
+  ivf_nprobe: 32
+  hnsw_ef: 64
+  job_id: null
+  job_ids: null
+  collection: null
+
+metadata:
+  doc_date_min: null
+  doc_date_max: null
+  source_type: null
+  section: null
+
+features:
+  use_query_rewrite: false
+  use_query_decomposition: false
+  max_subqueries: 3
+  use_filter_generation: false
+  min_filter_keep: 3
+  use_reflection_loops: false
+  max_reflection_loops: 2
+  require_citations: true
+  use_rerank: true
+
+prompt:
+  template_key: default
+  max_context_chars: 6000
+  truncation: head
+
+semantic_cache:
+  enabled: false
+  threshold: 0.93
+  max_entries: 512

@@ -27,7 +27,9 @@ from src.reranker import load_reranker
 
 
 def _metrics_for_table(m: Dict[str, Any]) -> Dict[str, Any]:
-    return {k: v for k, v in m.items() if k not in ("per_example", "approx_total_tokens")}
+    return {
+        k: v for k, v in m.items() if k not in ("per_example", "approx_total_tokens")
+    }
 
 
 def _log_run(
@@ -151,7 +153,9 @@ def run_compare_topk(
             faiss_index=faiss_index,
             return_per_example=True,
         )
-        rows.append({"experiment": "topk", "setting": f"final_k={fk}", **_metrics_for_table(m)})
+        rows.append(
+            {"experiment": "topk", "setting": f"final_k={fk}", **_metrics_for_table(m)}
+        )
         if log_meta:
             _log_run("topk", f"final_k={fk}", cfg, m, log_meta)
         print(f"final_k={fk}", _metrics_for_table(m))
@@ -245,7 +249,9 @@ def run_compare_truncation(
             faiss_index=faiss_index,
             return_per_example=True,
         )
-        rows.append({"experiment": "truncation", "setting": strat, **_metrics_for_table(m)})
+        rows.append(
+            {"experiment": "truncation", "setting": strat, **_metrics_for_table(m)}
+        )
         if log_meta:
             _log_run("truncation", strat, cfg, m, log_meta)
         print(strat, _metrics_for_table(m))
@@ -253,18 +259,35 @@ def run_compare_truncation(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="RAG end-to-end answer quality (EM, F1, gold hit)")
+    parser = argparse.ArgumentParser(
+        description="RAG end-to-end answer quality (EM, F1, gold hit)"
+    )
     parser.add_argument(
         "--mode",
-        choices=["compare-rerank", "compare-topk", "compare-prompts", "compare-truncation", "all"],
+        choices=[
+            "compare-rerank",
+            "compare-topk",
+            "compare-prompts",
+            "compare-truncation",
+            "all",
+        ],
         default="all",
     )
-    parser.add_argument("--data-path", type=Path, default=ROOT / "datasets" / "qa_dataset.jsonl")
+    parser.add_argument(
+        "--data-path", type=Path, default=ROOT / "datasets" / "qa_dataset.jsonl"
+    )
     parser.add_argument("--out-dir", type=Path, default=ROOT / "results")
     parser.add_argument("--embedding-model", default="BAAI/bge-base-en-v1.5")
     parser.add_argument("--rerank-model", default="BAAI/bge-reranker-base")
-    parser.add_argument("--retrieve-k", type=int, default=10, help="FAISS top-k when reranking")
-    parser.add_argument("--final-k", type=int, default=3, help="Passages fed to the LLM after retrieve/rerank")
+    parser.add_argument(
+        "--retrieve-k", type=int, default=10, help="FAISS top-k when reranking"
+    )
+    parser.add_argument(
+        "--final-k",
+        type=int,
+        default=3,
+        help="Passages fed to the LLM after retrieve/rerank",
+    )
     parser.add_argument("--max-context-chars", type=int, default=6000)
     parser.add_argument("--use-semantic-cache", action="store_true")
     parser.add_argument("--semantic-cache-threshold", type=float, default=0.93)
@@ -276,7 +299,9 @@ def main() -> None:
         default=1200,
         help="For compare-truncation: tight char budget so head/tail/middle differ",
     )
-    parser.add_argument("--truncation", default="head", choices=("head", "tail", "middle"))
+    parser.add_argument(
+        "--truncation", default="head", choices=("head", "tail", "middle")
+    )
     parser.add_argument(
         "--llm-backend",
         choices=("gemini", "openai", "ollama"),
@@ -360,16 +385,39 @@ def main() -> None:
     if args.mode in ("compare-rerank", "all"):
         all_rows.extend(
             run_compare_rerank(
-                embedder, corpus_chunks, examples, generator, base, reranker, faiss_index, log_meta
+                embedder,
+                corpus_chunks,
+                examples,
+                generator,
+                base,
+                reranker,
+                faiss_index,
+                log_meta,
             )
         )
     if args.mode in ("compare-topk", "all"):
         all_rows.extend(
-            run_compare_topk(embedder, corpus_chunks, examples, generator, base, faiss_index, log_meta)
+            run_compare_topk(
+                embedder,
+                corpus_chunks,
+                examples,
+                generator,
+                base,
+                faiss_index,
+                log_meta,
+            )
         )
     if args.mode in ("compare-prompts", "all"):
         all_rows.extend(
-            run_compare_prompts(embedder, corpus_chunks, examples, generator, base, faiss_index, log_meta)
+            run_compare_prompts(
+                embedder,
+                corpus_chunks,
+                examples,
+                generator,
+                base,
+                faiss_index,
+                log_meta,
+            )
         )
     if args.mode in ("compare-truncation", "all"):
         all_rows.extend(

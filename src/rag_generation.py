@@ -331,7 +331,10 @@ def evaluate_rag_answer_quality(
                     if sim > best_sim:
                         best_sim = sim
                         best_answer = ans
-                if best_answer is not None and best_sim >= config.semantic_cache_threshold:
+                if (
+                    best_answer is not None
+                    and best_sim >= config.semantic_cache_threshold
+                ):
                     cache_hits += 1.0
                     cached_prediction = best_answer
 
@@ -349,11 +352,7 @@ def evaluate_rag_answer_quality(
                     )
                     continue
                 fi = build_retrieval_index(embedder, chunks)
-                bm25 = (
-                    build_bm25_resources(chunks)
-                    if config.use_hybrid
-                    else None
-                )
+                bm25 = build_bm25_resources(chunks) if config.use_hybrid else None
                 fusion = config.fusion_list_k
                 if bm25 is not None and fusion is None:
                     fusion = len(chunks)
@@ -444,7 +443,11 @@ def evaluate_rag_answer_quality(
                 config.prompt_template, context=context, question=ex.question
             )
             t0_generate = perf_counter()
-            prediction = cached_prediction if cached_prediction is not None else generator.generate(prompt)
+            prediction = (
+                cached_prediction
+                if cached_prediction is not None
+                else generator.generate(prompt)
+            )
             generate_ms = (perf_counter() - t0_generate) * 1000.0
             lat_generate_ms.append(generate_ms)
 
@@ -497,7 +500,9 @@ def evaluate_rag_answer_quality(
         "latency_retrieve_ms": mean(lat_retrieve_ms),
         "latency_rewrite_ms": mean(lat_rewrite_ms),
         "latency_generate_ms": mean(lat_generate_ms),
-        "semantic_cache_hit_rate": (cache_hits / cache_lookups) if cache_lookups > 0 else 0.0,
+        "semantic_cache_hit_rate": (
+            (cache_hits / cache_lookups) if cache_lookups > 0 else 0.0
+        ),
         "n_questions": float(len(examples)),
         "n_failures": failures,
     }

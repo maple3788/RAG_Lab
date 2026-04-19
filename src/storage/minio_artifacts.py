@@ -71,7 +71,9 @@ class MinioArtifactStore:
     def bucket_name(self) -> str:
         return self._settings.bucket
 
-    def put_json(self, object_name: str, obj: Any, content_type: str = "application/json") -> None:
+    def put_json(
+        self, object_name: str, obj: Any, content_type: str = "application/json"
+    ) -> None:
         raw = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
         self.put_bytes(object_name, raw, content_type=content_type)
 

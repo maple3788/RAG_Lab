@@ -32,7 +32,12 @@ from src.error_analysis import (
     gold_in_any_chunk,
     gold_lost_to_truncation,
 )
-from src.generator import GeminiGenerator, MockGenerator, OllamaGenerator, OpenAICompatibleGenerator
+from src.generator import (
+    GeminiGenerator,
+    MockGenerator,
+    OllamaGenerator,
+    OpenAICompatibleGenerator,
+)
 from src.loader import QAExample
 from src.prompts import PROMPT_TEMPLATES, format_rag_prompt
 from src.rag_generation import passages_to_context
@@ -64,7 +69,9 @@ def _gold_list(ex: QAExample) -> list[str]:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Export TriviaQA RC traces for error analysis")
+    p = argparse.ArgumentParser(
+        description="Export TriviaQA RC traces for error analysis"
+    )
     p.add_argument("--out", type=Path, required=True, help="Output JSONL path")
     p.add_argument("--split", default="validation")
     p.add_argument("--max-examples", type=int, default=50)
@@ -78,13 +85,26 @@ def main() -> None:
     p.add_argument("--chunk-overlap", type=int, default=64)
     p.add_argument("--max-context-chars", type=int, default=6000)
     p.add_argument("--truncation", default="head", choices=("head", "tail", "middle"))
-    p.add_argument("--prompt-name", default="default", choices=tuple(PROMPT_TEMPLATES.keys()))
+    p.add_argument(
+        "--prompt-name", default="default", choices=tuple(PROMPT_TEMPLATES.keys())
+    )
     p.add_argument("--use-rerank", action="store_true")
-    p.add_argument("--skip-generation", action="store_true", help="Do not call LLM; EM/F1/gold_hit = 0")
+    p.add_argument(
+        "--skip-generation",
+        action="store_true",
+        help="Do not call LLM; EM/F1/gold_hit = 0",
+    )
     p.add_argument("--mock-generation", action="store_true")
-    p.add_argument("--llm-backend", choices=("gemini", "openai", "ollama"), default="ollama")
+    p.add_argument(
+        "--llm-backend", choices=("gemini", "openai", "ollama"), default="ollama"
+    )
     p.add_argument("--llm-model", default=None)
-    p.add_argument("--preview-chars", type=int, default=400, help="Max chars per chunk stored in JSON")
+    p.add_argument(
+        "--preview-chars",
+        type=int,
+        default=400,
+        help="Max chars per chunk stored in JSON",
+    )
     args = p.parse_args()
 
     if args.llm_model is None:
@@ -149,9 +169,7 @@ def main() -> None:
             any_final = gold_in_any_chunk(final, golds)
 
             raw_ctx = passages_to_context(final)
-            trunc_ctx = truncate_context(
-                raw_ctx, args.max_context_chars, trunc
-            )
+            trunc_ctx = truncate_context(raw_ctx, args.max_context_chars, trunc)
             lost_trunc = gold_lost_to_truncation(raw_ctx, trunc_ctx, golds)
 
             prediction = ""
@@ -163,7 +181,11 @@ def main() -> None:
 
             em = max(exact_match(prediction, g) for g in golds) if prediction else 0.0
             f1 = max(token_f1(prediction, g) for g in golds) if prediction else 0.0
-            gh = max(gold_answer_hit(prediction, g) for g in golds) if prediction else 0.0
+            gh = (
+                max(gold_answer_hit(prediction, g) for g in golds)
+                if prediction
+                else 0.0
+            )
 
             if not any_pool:
                 stage = "retrieval"

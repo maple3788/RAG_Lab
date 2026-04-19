@@ -15,7 +15,18 @@ from prometheus_client import Counter, Histogram, generate_latest
 from starlette.responses import JSONResponse, Response
 
 from src.context_truncation import truncate_context
-from src.document_ingest_pipeline import IngestPipelineConfig, load_ingest_from_minio, run_document_ingest
+from src.config import (
+    RAGPipelineConfig,
+    load_ingest_config,
+    merge_ingest_with_dict,
+    rag_pipeline_config_from_query_request,
+)
+from src.document_ingest_pipeline import (
+    IngestPipelineConfig,
+    load_chunk_records_from_minio,
+    load_ingest_from_minio,
+    run_document_ingest,
+)
 from src.embedder import EmbeddingModel, load_embedding_model, prepare_query
 from src.hybrid_retrieval import fuse_milvus_dense_order_with_bm25
 from src.generator import OllamaGenerator
@@ -24,6 +35,7 @@ from src.prompts import PROMPT_TEMPLATES, format_rag_prompt
 from src.rag_generation import passages_to_context
 from src.rag_pipeline import record_rag_generation_latency, record_rag_retrieval_latency
 from src.reranker import Reranker, load_reranker
+from src.milvus_metadata import ChunkMetadataFilter
 from src.storage.milvus_store import MilvusChunkStore, MilvusSearchConfig
 from src.storage.minio_artifacts import MinioArtifactStore
 from src.storage.redis_semantic_cache import RedisSemanticCache
@@ -36,7 +48,9 @@ RAG_SYSTEM_PROMPT = (
     "If evidence is insufficient, say unknown."
 )
 
-REQ_TOTAL = Counter("rag_api_requests_total", "RAG API request count", ["endpoint", "status"])
+REQ_TOTAL = Counter(
+    "rag_api_requests_total", "RAG API request count", ["endpoint", "status"]
+)
 REQ_LAT = Histogram(
     "rag_api_request_seconds",
     "RAG API request latency",
@@ -79,6 +93,11 @@ class QueryRequest(BaseModel):
     truncation: str = Field(default="head", pattern="^(head|tail|middle)$")
     prompt_template: str = Field(default="default")
     include_debug: bool = False
+    #: Metadata filters (must match values stored at ingest). ISO dates ``YYYY-MM-DD``.
+    filter_doc_date_min: Optional[str] = Field(default=None, max_length=32)
+    filter_doc_date_max: Optional[str] = Field(default=None, max_length=32)
+    filter_source_type: Optional[str] = Field(default=None, max_length=64)
+    filter_section: Optional[str] = Field(default=None, max_length=256)
 
 
 class QueryResponse(BaseModel):
@@ -125,7 +144,9 @@ class TTLCache:
         return item.value
 
     def set(self, key: str, value: QueryResponse) -> None:
-        self._store[key] = CacheItem(value=value, expires_at=time.time() + self.ttl_seconds)
+        self._store[key] = CacheItem(
+            value=value, expires_at=time.time() + self.ttl_seconds
+        )
         self._store.move_to_end(key, last=True)
         while len(self._store) > self.max_items:
             self._store.popitem(last=False)
@@ -142,7 +163,9 @@ _l1_cache = TTLCache(
     ttl_seconds=int(os.environ.get("RAG_L1_CACHE_TTL_SEC", "120")),
 )
 _key_locks: dict[str, asyncio.Lock] = {}
-_generation_sem = asyncio.Semaphore(int(os.environ.get("RAG_MAX_GENERATION_CONCURRENCY", "8")))
+_generation_sem = asyncio.Semaphore(
+    int(os.environ.get("RAG_MAX_GENERATION_CONCURRENCY", "8"))
+)
 
 
 class QueryStageError(Exception):
@@ -209,7 +232,9 @@ def _minio_store() -> MinioArtifactStore:
 def _generator() -> OllamaGenerator:
     global _gen
     if _gen is None:
-        _gen = OllamaGenerator(model=os.environ.get("OLLAMA_MODEL", "llama3.2"), max_tokens=512)
+        _gen = OllamaGenerator(
+            model=os.environ.get("OLLAMA_MODEL", "llama3.2"), max_tokens=512
+        )
     return _gen
 
 
@@ -271,7 +296,9 @@ def _normalize_job_id_list(raw: list[str]) -> list[str]:
     return out
 
 
-def _resolve_job_ids_for_query(req: QueryRequest, x_rag_session_id: Optional[str]) -> list[str]:
+def _resolve_job_ids_for_query(
+    req: QueryRequest, x_rag_session_id: Optional[str]
+) -> list[str]:
     if req.job_ids is not None:
         ids = _normalize_job_id_list(list(req.job_ids))
         if ids:
@@ -301,21 +328,28 @@ def _resolve_job_ids_for_query(req: QueryRequest, x_rag_session_id: Optional[str
 
 def _resolve_query_target(req: QueryRequest) -> QueryRequest:
     # Explicit request params always win.
-    if _normalized_milvus_collection(req.milvus_collection) and (req.milvus_index_type or "").strip():
+    if (
+        _normalized_milvus_collection(req.milvus_collection)
+        and (req.milvus_index_type or "").strip()
+    ):
         return req
     try:
         meta = _minio_store().get_job_metadata(req.job_id.strip()) or {}
     except Exception:
         meta = {}
-    resolved_collection = _normalized_milvus_collection(req.milvus_collection) or _normalized_milvus_collection(
-        meta.get("milvus_collection")
-    )
-    resolved_index_type = (req.milvus_index_type or "").strip() or str(meta.get("milvus_index_type", "")).strip()
+    resolved_collection = _normalized_milvus_collection(
+        req.milvus_collection
+    ) or _normalized_milvus_collection(meta.get("milvus_collection"))
+    resolved_index_type = (req.milvus_index_type or "").strip() or str(
+        meta.get("milvus_index_type", "")
+    ).strip()
     return req.model_copy(
         update={
             "milvus_collection": resolved_collection,
             "milvus_index_type": resolved_index_type or "AUTOINDEX",
-            "milvus_metric_type": req.milvus_metric_type or str(meta.get("milvus_metric_type", "")).strip() or None,
+            "milvus_metric_type": req.milvus_metric_type
+            or str(meta.get("milvus_metric_type", "")).strip()
+            or None,
         }
     )
 
@@ -341,11 +375,37 @@ def _cache_key(req: QueryRequest) -> str:
         "retrieval_mode": getattr(req, "retrieval_mode", "dense"),
         "fusion_list_k": int(req.fusion_list_k),
         "rrf_k": int(req.rrf_k),
+        "filter_doc_date_min": (req.filter_doc_date_min or "").strip() or None,
+        "filter_doc_date_max": (req.filter_doc_date_max or "").strip() or None,
+        "filter_source_type": (req.filter_source_type or "").strip() or None,
+        "filter_section": (req.filter_section or "").strip() or None,
     }
-    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
 
-def _hybrid_lexical_corpus(job_ids: list[str]) -> tuple[list[str], list[str], list[int], dict[tuple[str, int], int]]:
+def _metadata_filter_expr_from_config(pipe: RAGPipelineConfig) -> Optional[str]:
+    meta = pipe.metadata
+    if not any(
+        (
+            (meta.doc_date_min or "").strip(),
+            (meta.doc_date_max or "").strip(),
+            (meta.source_type or "").strip(),
+            (meta.section or "").strip(),
+        )
+    ):
+        return None
+    try:
+        return meta.milvus_expression()
+    except ValueError as e:
+        raise QueryStageError("query", str(e), status_code=400) from e
+
+
+def _hybrid_lexical_corpus(
+    job_ids: list[str],
+    meta_filter: Optional[ChunkMetadataFilter],
+) -> tuple[list[str], list[str], list[int], dict[tuple[str, int], int]]:
     """MinIO chunk texts aligned with Milvus rows (job_id + chunk_index)."""
     corpus: list[str] = []
     job_at: list[str] = []
@@ -354,8 +414,13 @@ def _hybrid_lexical_corpus(job_ids: list[str]) -> tuple[list[str], list[str], li
     max_c = int(os.environ.get("RAG_HYBRID_MAX_CHUNKS", "8000"))
     for jid in job_ids:
         j = jid.strip()
-        texts, _ = load_ingest_from_minio(j)
-        for i, t in enumerate(texts):
+        records = load_chunk_records_from_minio(j)
+        for i, rec in enumerate(records):
+            if meta_filter is not None and not meta_filter.matches_record(rec):
+                continue
+            t = str(rec.get("text") or "")
+            if not t.strip():
+                continue
             if len(corpus) >= max_c:
                 raise ValueError(
                     f"hybrid lexical corpus exceeds RAG_HYBRID_MAX_CHUNKS ({max_c})"
@@ -368,23 +433,25 @@ def _hybrid_lexical_corpus(job_ids: list[str]) -> tuple[list[str], list[str], li
     return corpus, job_at, cidx_at, key_to_gi
 
 
-def _milvus_dense_candidates(req: QueryRequest, job_ids: list[str], dense_cap: int) -> list[dict[str, Any]]:
+def _milvus_dense_candidates(
+    pipe: RAGPipelineConfig, job_ids: list[str], question: str, dense_cap: int
+) -> list[dict[str, Any]]:
     """Milvus ANN hits (no rerank), up to ``dense_cap`` rows in relevance order."""
-    search_cfg = MilvusSearchConfig(
-        metric_type=(req.milvus_metric_type or "COSINE").strip(),
-        ivf_nprobe=int(req.milvus_ivf_nprobe),
-        hnsw_ef=int(req.milvus_hnsw_ef),
-    )
+    mf = _metadata_filter_expr_from_config(pipe)
+    m = pipe.milvus
+    search_cfg = m.search_config()
     store = _milvus_store()
+    q = question.strip()
     if len(job_ids) == 1:
         return store.search_job_chunks(
             job_id=job_ids[0].strip(),
-            query=req.question.strip(),
+            query=q,
             embedder=_embed(),
             top_k=dense_cap,
-            index_type=(req.milvus_index_type or "AUTOINDEX").strip(),
+            index_type=(m.index_type or "AUTOINDEX").strip(),
             search_config=search_cfg,
-            collection_name=_normalized_milvus_collection(req.milvus_collection),
+            collection_name=_normalized_milvus_collection(m.collection),
+            metadata_filter_expr=mf,
         )
     groups: dict[str, list[str]] = {}
     metas: dict[str, dict[str, Any]] = {}
@@ -399,45 +466,70 @@ def _milvus_dense_candidates(req: QueryRequest, job_ids: list[str], dense_cap: i
     all_rows: list[dict[str, Any]] = []
     for coll, jids_in in groups.items():
         m0 = metas.get(jids_in[0], {})
-        idx_type = (req.milvus_index_type or "").strip() or str(m0.get("milvus_index_type", "AUTOINDEX"))
-        mtype = (req.milvus_metric_type or "").strip() or str(m0.get("milvus_metric_type", "COSINE"))
+        idx_type = (m.index_type or "").strip() or str(
+            m0.get("milvus_index_type", "AUTOINDEX")
+        )
+        mtype = (m.metric_type or "").strip() or str(
+            m0.get("milvus_metric_type", "COSINE")
+        )
         sc = MilvusSearchConfig(
             metric_type=mtype,
-            ivf_nprobe=int(req.milvus_ivf_nprobe),
-            hnsw_ef=int(req.milvus_hnsw_ef),
+            ivf_nprobe=int(m.ivf_nprobe),
+            hnsw_ef=int(m.hnsw_ef),
         )
         part = store.search_multi_job_chunks(
             job_ids=jids_in,
-            query=req.question.strip(),
+            query=q,
             embedder=_embed(),
             top_k=dense_cap,
             index_type=str(idx_type or "AUTOINDEX").strip(),
             search_config=sc,
             collection_name=coll,
+            metadata_filter_expr=mf,
         )
         all_rows.extend(part)
     all_rows.sort(key=lambda r: float(r.get("faiss_score", 0.0)))
     return all_rows[:dense_cap]
 
 
-def _rows_rerank_final(req: QueryRequest, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if req.use_rerank and rows:
+def _rows_rerank_final(
+    pipe: RAGPipelineConfig,
+    rows: list[dict[str, Any]],
+    question: str,
+) -> list[dict[str, Any]]:
+    ret = pipe.retrieval
+    if pipe.features.use_rerank and rows:
         texts = [str(r["text"]) for r in rows]
-        reranked, _ = _rr().rerank(req.question.strip(), texts, top_k=min(req.final_k, len(texts)))
+        reranked, _ = _rr().rerank(
+            question.strip(), texts, top_k=min(ret.final_k, len(texts))
+        )
         rank_by_text = {t: i for i, t in enumerate(reranked)}
         rows = sorted(
             (r for r in rows if r["text"] in rank_by_text),
             key=lambda r: rank_by_text[r["text"]],
         )
-        return rows[: req.final_k]
-    return rows[: req.final_k]
+        return rows[: ret.final_k]
+    return rows[: ret.final_k]
 
 
-def _retrieve_hybrid_milvus(req: QueryRequest, job_ids: list[str]) -> tuple[list[dict[str, Any]], float]:
+def _retrieve_hybrid_milvus(
+    pipe: RAGPipelineConfig, job_ids: list[str], question: str
+) -> tuple[list[dict[str, Any]], float]:
     """BM25 (lexical over MinIO chunks) + Milvus dense order, merged via RRF; then cross-encoder to ``final_k``."""
+    _metadata_filter_expr_from_config(pipe)
     t0 = time.perf_counter()
+    meta = pipe.metadata
+    meta_f = ChunkMetadataFilter.from_query_params(
+        doc_date_min=meta.doc_date_min,
+        doc_date_max=meta.doc_date_max,
+        source_type=meta.source_type,
+        section=meta.section,
+    )
+    ret = pipe.retrieval
+    fusion_k = int(ret.fusion_list_k or 30)
+    q = question.strip()
     try:
-        corpus, job_at, cidx_at, key_to_gi = _hybrid_lexical_corpus(job_ids)
+        corpus, job_at, cidx_at, key_to_gi = _hybrid_lexical_corpus(job_ids, meta_f)
     except ValueError as e:
         raise QueryStageError("retrieval", str(e), status_code=400) from e
     if not corpus:
@@ -446,8 +538,8 @@ def _retrieve_hybrid_milvus(req: QueryRequest, job_ids: list[str]) -> tuple[list
             "empty lexical corpus — ingest jobs need MinIO chunks.json",
             status_code=400,
         )
-    dense_cap = min(max(int(req.retrieve_k), int(req.fusion_list_k)), 64)
-    dense_rows = _milvus_dense_candidates(req, job_ids, dense_cap)
+    dense_cap = min(max(int(ret.retrieve_k), fusion_k), 64)
+    dense_rows = _milvus_dense_candidates(pipe, job_ids, q, dense_cap)
     ordered_gi: list[int] = []
     seen_gi: set[int] = set()
     for row in dense_rows:
@@ -461,18 +553,18 @@ def _retrieve_hybrid_milvus(req: QueryRequest, job_ids: list[str]) -> tuple[list
         seen_gi.add(gi)
         ordered_gi.append(gi)
     fused_idx = fuse_milvus_dense_order_with_bm25(
-        req.question.strip(),
+        q,
         corpus_chunks=corpus,
         dense_global_indices_ordered=ordered_gi,
-        retrieve_k=int(req.retrieve_k),
-        fusion_list_k=int(req.fusion_list_k),
-        rrf_k=int(req.rrf_k),
+        retrieve_k=int(ret.retrieve_k),
+        fusion_list_k=fusion_k,
+        rrf_k=int(ret.rrf_k),
     )
     rows: list[dict[str, Any]] = []
     for rank, gi in enumerate(fused_idx, start=1):
         rows.append(
             {
-                "query_used": req.question.strip(),
+                "query_used": q,
                 "faiss_rank": rank,
                 "chunk_index": cidx_at[gi],
                 "faiss_score": 1.0 / float(rank),
@@ -481,38 +573,50 @@ def _retrieve_hybrid_milvus(req: QueryRequest, job_ids: list[str]) -> tuple[list
                 "retrieval": "hybrid_rrf",
             }
         )
-    rows = _rows_rerank_final(req, rows)
+    rows = _rows_rerank_final(pipe, rows, q)
     dt = time.perf_counter() - t0
     record_rag_retrieval_latency(dt)
     return rows, dt
 
 
-def _retrieve(req: QueryRequest) -> tuple[list[dict[str, Any]], float]:
+def _retrieve(
+    pipe: RAGPipelineConfig, question: str
+) -> tuple[list[dict[str, Any]], float]:
     t0 = time.perf_counter()
-    search_cfg = MilvusSearchConfig(
-        metric_type=(req.milvus_metric_type or "COSINE").strip(),
-        ivf_nprobe=int(req.milvus_ivf_nprobe),
-        hnsw_ef=int(req.milvus_hnsw_ef),
-    )
+    mf = _metadata_filter_expr_from_config(pipe)
+    m = pipe.milvus
+    search_cfg = m.search_config()
+    q = question.strip()
+    jid = (m.job_id or "").strip()
+    if not jid:
+        raise QueryStageError(
+            "query", "missing job_id for dense retrieval", status_code=400
+        )
     rows = _milvus_store().search_job_chunks(
-        job_id=req.job_id.strip(),
-        query=req.question.strip(),
+        job_id=jid,
+        query=q,
         embedder=_embed(),
-        top_k=req.retrieve_k,
-        index_type=(req.milvus_index_type or "AUTOINDEX").strip(),
+        top_k=pipe.retrieval.retrieve_k,
+        index_type=(m.index_type or "AUTOINDEX").strip(),
         search_config=search_cfg,
-        collection_name=_normalized_milvus_collection(req.milvus_collection),
+        collection_name=_normalized_milvus_collection(m.collection),
+        metadata_filter_expr=mf,
     )
-    rows = _rows_rerank_final(req, rows)
+    rows = _rows_rerank_final(pipe, rows, q)
     dt = time.perf_counter() - t0
     record_rag_retrieval_latency(dt)
     return rows, dt
 
 
-def _retrieve_multi(req: QueryRequest, job_ids: list[str]) -> tuple[list[dict[str, Any]], float]:
+def _retrieve_multi(
+    pipe: RAGPipelineConfig, job_ids: list[str], question: str
+) -> tuple[list[dict[str, Any]], float]:
     """Retrieve across multiple jobs, possibly spanning multiple Milvus collections."""
     t0 = time.perf_counter()
+    mf = _metadata_filter_expr_from_config(pipe)
+    m = pipe.milvus
     store = _milvus_store()
+    q = question.strip()
     groups: dict[str, list[str]] = {}
     metas: dict[str, dict[str, Any]] = {}
     for jid in job_ids:
@@ -520,32 +624,39 @@ def _retrieve_multi(req: QueryRequest, job_ids: list[str]) -> tuple[list[dict[st
         meta = _minio_store().get_job_metadata(j) or {}
         coll = _normalized_milvus_collection(meta.get("milvus_collection"))
         if not coll:
-            raise ValueError(f"missing milvus_collection in MinIO metadata for job_id={j}")
+            raise ValueError(
+                f"missing milvus_collection in MinIO metadata for job_id={j}"
+            )
         groups.setdefault(coll, []).append(j)
         metas[j] = meta
     all_rows: list[dict[str, Any]] = []
     for coll, jids_in in groups.items():
         m0 = metas.get(jids_in[0], {})
-        idx_type = (req.milvus_index_type or "").strip() or str(m0.get("milvus_index_type", "AUTOINDEX"))
-        mtype = (req.milvus_metric_type or "").strip() or str(m0.get("milvus_metric_type", "COSINE"))
+        idx_type = (m.index_type or "").strip() or str(
+            m0.get("milvus_index_type", "AUTOINDEX")
+        )
+        mtype = (m.metric_type or "").strip() or str(
+            m0.get("milvus_metric_type", "COSINE")
+        )
         sc = MilvusSearchConfig(
             metric_type=mtype,
-            ivf_nprobe=int(req.milvus_ivf_nprobe),
-            hnsw_ef=int(req.milvus_hnsw_ef),
+            ivf_nprobe=int(m.ivf_nprobe),
+            hnsw_ef=int(m.hnsw_ef),
         )
         part = store.search_multi_job_chunks(
             job_ids=jids_in,
-            query=req.question.strip(),
+            query=q,
             embedder=_embed(),
-            top_k=req.retrieve_k,
+            top_k=pipe.retrieval.retrieve_k,
             index_type=str(idx_type or "AUTOINDEX").strip(),
             search_config=sc,
             collection_name=coll,
+            metadata_filter_expr=mf,
         )
         all_rows.extend(part)
     all_rows.sort(key=lambda r: float(r.get("faiss_score", 0.0)))
-    all_rows = all_rows[: req.retrieve_k]
-    all_rows = _rows_rerank_final(req, all_rows)
+    all_rows = all_rows[: pipe.retrieval.retrieve_k]
+    all_rows = _rows_rerank_final(pipe, all_rows, q)
     dt = time.perf_counter() - t0
     record_rag_retrieval_latency(dt)
     return all_rows, dt
@@ -563,10 +674,14 @@ def _passages_for_prompt(rows: list[dict[str, Any]]) -> list[str]:
     return out
 
 
-def _build_prompt(req: QueryRequest, passages: list[str]) -> str:
-    context = truncate_context(passages_to_context(passages), req.max_context_chars, req.truncation)  # type: ignore[arg-type]
-    template = PROMPT_TEMPLATES.get(req.prompt_template, PROMPT_TEMPLATES["default"])
-    user = format_rag_prompt(template, context=context, question=req.question.strip(), history="None")
+def _build_prompt(pipe: RAGPipelineConfig, passages: list[str], question: str) -> str:
+    pr = pipe.prompt
+    context = truncate_context(
+        passages_to_context(passages), pr.max_context_chars, pr.truncation
+    )  # type: ignore[arg-type]
+    template = PROMPT_TEMPLATES.get(pr.template_key, PROMPT_TEMPLATES["default"])
+    q = question.strip()
+    user = format_rag_prompt(template, context=context, question=q, history="None")
     return f"SYSTEM_PROMPT:\n{RAG_SYSTEM_PROMPT}\n\nUSER_PROMPT:\n{user}"
 
 
@@ -585,9 +700,15 @@ async def _run_query(req: QueryRequest) -> QueryResponse:
     if not jids:
         raise QueryStageError("query", "missing job_ids / job_id", status_code=400)
     if len(jids) == 1:
-        req_eff = _resolve_query_target(req.model_copy(update={"job_id": jids[0], "job_ids": jids}))
+        req_eff = _resolve_query_target(
+            req.model_copy(update={"job_id": jids[0], "job_ids": jids})
+        )
     else:
-        req_eff = req.model_copy(update={"job_ids": jids, "job_id": jids[0] if jids else req.job_id})
+        req_eff = req.model_copy(
+            update={"job_ids": jids, "job_id": jids[0] if jids else req.job_id}
+        )
+    pipe = rag_pipeline_config_from_query_request(req_eff)
+    question = req_eff.question.strip()
     key = _cache_key(req_eff)
     hit = _l1_cache.get(key)
     if hit is not None:
@@ -603,24 +724,30 @@ async def _run_query(req: QueryRequest) -> QueryResponse:
 
         emb = _embed()
         multi = len(jids) > 1
-        hybrid = getattr(req_eff, "retrieval_mode", "dense") == "hybrid"
+        hybrid = pipe.retrieval.mode == "hybrid"
         try:
             if multi or hybrid:
                 semantic = None
-            elif not req_eff.use_semantic_cache:
+            elif not pipe.semantic_cache.enabled:
                 semantic = None
             else:
                 semantic = RedisSemanticCache(namespace=req_eff.job_id.strip())
         except Exception as e:
-            raise QueryStageError("semantic_cache_init", f"semantic cache init failed: {e}") from e
+            raise QueryStageError(
+                "semantic_cache_init", f"semantic cache init failed: {e}"
+            ) from e
         sem_answer: Optional[str] = None
         q_emb: Optional[Any] = None
         if semantic is not None:
             try:
-                q_emb = emb.encode([prepare_query(emb.name, req_eff.question.strip())])[0]
-                sem_answer = semantic.lookup(q_emb, threshold=req_eff.semantic_cache_threshold)
+                q_emb = emb.encode([prepare_query(emb.name, question)])[0]
+                sem_answer = semantic.lookup(
+                    q_emb, threshold=pipe.semantic_cache.threshold
+                )
             except Exception as e:
-                raise QueryStageError("semantic_cache_lookup", f"semantic cache lookup failed: {e}") from e
+                raise QueryStageError(
+                    "semantic_cache_lookup", f"semantic cache lookup failed: {e}"
+                ) from e
             if sem_answer:
                 CACHE_HIT.labels(layer="semantic").inc()
                 resp = QueryResponse(
@@ -637,16 +764,20 @@ async def _run_query(req: QueryRequest) -> QueryResponse:
 
         try:
             if hybrid:
-                rows, retrieval_s = await asyncio.to_thread(_retrieve_hybrid_milvus, req_eff, jids)
+                rows, retrieval_s = await asyncio.to_thread(
+                    _retrieve_hybrid_milvus, pipe, jids, question
+                )
             elif len(jids) <= 1:
-                rows, retrieval_s = await asyncio.to_thread(_retrieve, req_eff)
+                rows, retrieval_s = await asyncio.to_thread(_retrieve, pipe, question)
             else:
-                rows, retrieval_s = await asyncio.to_thread(_retrieve_multi, req_eff, jids)
+                rows, retrieval_s = await asyncio.to_thread(
+                    _retrieve_multi, pipe, jids, question
+                )
         except Exception as e:
             raise QueryStageError("retrieval", f"retrieval failed: {e}") from e
         passages = _passages_for_prompt(rows)
         try:
-            prompt = _build_prompt(req_eff, passages)
+            prompt = _build_prompt(pipe, passages, question)
         except Exception as e:
             raise QueryStageError(
                 "prompt_build",
@@ -681,13 +812,15 @@ async def _run_query(req: QueryRequest) -> QueryResponse:
         if semantic is not None:
             try:
                 if q_emb is None:
-                    q_emb = emb.encode([prepare_query(emb.name, req_eff.question.strip())])[0]
+                    q_emb = emb.encode([prepare_query(emb.name, question)])[0]
                 semantic.write(
-                    question=req_eff.question.strip(),
+                    question=question,
                     answer=answer,
                     query_embedding=q_emb,
-                    max_entries=int(os.environ.get("RAG_SEMANTIC_CACHE_MAX_ENTRIES", "512")),
-                    ttl_seconds=int(os.environ.get("RAG_SEMANTIC_CACHE_TTL_SEC", "86400")),
+                    max_entries=int(pipe.semantic_cache.max_entries),
+                    ttl_seconds=int(
+                        os.environ.get("RAG_SEMANTIC_CACHE_TTL_SEC", "86400")
+                    ),
                 )
             except Exception as e:
                 raise QueryStageError(
@@ -729,7 +862,9 @@ async def query_rag(
     status = "ok"
     try:
         job_ids = _resolve_job_ids_for_query(req, x_rag_session_id)
-        result = await _run_query(req.model_copy(update={"job_ids": job_ids, "job_id": job_ids[0]}))
+        result = await _run_query(
+            req.model_copy(update={"job_ids": job_ids, "job_id": job_ids[0]})
+        )
         return result
     except QueryStageError as e:
         status = "error"
@@ -778,11 +913,16 @@ async def batch_rag(
     t0 = time.perf_counter()
     status = "ok"
     try:
+
         async def _one(q: QueryRequest) -> QueryResponse:
             job_ids = _resolve_job_ids_for_query(q, x_rag_session_id)
-            return await _run_query(q.model_copy(update={"job_ids": job_ids, "job_id": job_ids[0]}))
+            return await _run_query(
+                q.model_copy(update={"job_ids": job_ids, "job_id": job_ids[0]})
+            )
 
-        raw_results = await asyncio.gather(*(_one(q) for q in req.queries), return_exceptions=True)
+        raw_results = await asyncio.gather(
+            *(_one(q) for q in req.queries), return_exceptions=True
+        )
         results: list[dict[str, Any]] = []
         had_error = False
         for item in raw_results:
@@ -836,9 +976,13 @@ async def load_rag_job(req: LoadJobRequest) -> LoadJobResponse:
     try:
         meta = await asyncio.to_thread(_minio_store().get_job_metadata, jid)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"metadata lookup failed: {e}") from e
+        raise HTTPException(
+            status_code=500, detail=f"metadata lookup failed: {e}"
+        ) from e
     if not meta:
-        raise HTTPException(status_code=404, detail=f"job not found in MinIO metadata: {jid}")
+        raise HTTPException(
+            status_code=404, detail=f"job not found in MinIO metadata: {jid}"
+        )
 
     coll = _normalized_milvus_collection(str(meta.get("milvus_collection", "")))
     index_type = str(meta.get("milvus_index_type", "AUTOINDEX") or "AUTOINDEX")
@@ -857,7 +1001,9 @@ async def load_rag_job(req: LoadJobRequest) -> LoadJobResponse:
         try:
             await asyncio.to_thread(_session_set_job, sid, jid)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"session bind failed (Redis?): {e}") from e
+            raise HTTPException(
+                status_code=500, detail=f"session bind failed (Redis?): {e}"
+            ) from e
 
     return LoadJobResponse(
         job_id=jid,
@@ -878,18 +1024,26 @@ async def set_rag_session(body: SetSessionJobRequest) -> JSONResponse:
     try:
         meta = await asyncio.to_thread(_minio_store().get_job_metadata, jid)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"metadata lookup failed: {e}") from e
+        raise HTTPException(
+            status_code=500, detail=f"metadata lookup failed: {e}"
+        ) from e
     if not meta:
-        raise HTTPException(status_code=404, detail=f"job not found in MinIO metadata: {jid}")
+        raise HTTPException(
+            status_code=404, detail=f"job not found in MinIO metadata: {jid}"
+        )
     try:
         await asyncio.to_thread(_session_set_job, sid, jid)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"session store failed (Redis?): {e}") from e
+        raise HTTPException(
+            status_code=500, detail=f"session store failed (Redis?): {e}"
+        ) from e
     return JSONResponse({"ok": True, "session_id": sid, "job_id": jid})
 
 
 @app.delete("/v1/rag/session")
-async def clear_rag_session(session_id: str = Query(..., min_length=4, max_length=128)) -> JSONResponse:
+async def clear_rag_session(
+    session_id: str = Query(..., min_length=4, max_length=128)
+) -> JSONResponse:
     """Remove the active-job binding for ``session_id``."""
     try:
         await asyncio.to_thread(_session_clear, session_id.strip())
@@ -912,27 +1066,39 @@ def _ingest_config_from_form(
     milvus_hnsw_m: int,
     milvus_hnsw_ef_construction: int,
     milvus_upsert_batch_size: int,
+    doc_date: Optional[str] = None,
+    doc_section: str = "",
 ) -> IngestPipelineConfig:
     ex = extraction.strip().lower()
     if ex not in ("shallow", "full"):
-        raise HTTPException(status_code=400, detail="extraction must be shallow or full")
+        raise HTTPException(
+            status_code=400, detail="extraction must be shallow or full"
+        )
     sm = summarization.strip().lower()
     if sm not in ("single", "hierarchical", "iterative"):
-        raise HTTPException(status_code=400, detail="summarization must be single, hierarchical, or iterative")
-    return IngestPipelineConfig(
-        chunk_size=int(chunk_size),
-        chunk_overlap=int(chunk_overlap),
-        embedding_model=embedding_model.strip(),
-        extraction=ex,  # type: ignore[arg-type]
-        summarization=sm,  # type: ignore[arg-type]
-        llm_min_interval_seconds=float(llm_min_interval_seconds),
-        milvus_index_type=milvus_index_type.strip(),
-        milvus_metric_type=milvus_metric_type.strip(),
-        milvus_ivf_nlist=int(milvus_ivf_nlist),
-        milvus_hnsw_m=int(milvus_hnsw_m),
-        milvus_hnsw_ef_construction=int(milvus_hnsw_ef_construction),
-        milvus_upsert_batch_size=int(milvus_upsert_batch_size),
-    )
+        raise HTTPException(
+            status_code=400,
+            detail="summarization must be single, hierarchical, or iterative",
+        )
+    return merge_ingest_with_dict(
+        load_ingest_config(),
+        {
+            "chunk_size": int(chunk_size),
+            "chunk_overlap": int(chunk_overlap),
+            "embedding_model": embedding_model.strip(),
+            "extraction": ex,  # type: ignore[arg-type]
+            "summarization": sm,  # type: ignore[arg-type]
+            "llm_min_interval_seconds": float(llm_min_interval_seconds),
+            "milvus_index_type": milvus_index_type.strip(),
+            "milvus_metric_type": milvus_metric_type.strip(),
+            "milvus_ivf_nlist": int(milvus_ivf_nlist),
+            "milvus_hnsw_m": int(milvus_hnsw_m),
+            "milvus_hnsw_ef_construction": int(milvus_hnsw_ef_construction),
+            "milvus_upsert_batch_size": int(milvus_upsert_batch_size),
+            "doc_date": (doc_date or "").strip() or None,
+            "doc_section": (doc_section or "").strip(),
+        },
+    ).to_pipeline_dataclass()
 
 
 @app.post("/v1/rag/ingest")
@@ -952,6 +1118,8 @@ async def ingest_rag(
     milvus_hnsw_ef_construction: int = Form(200),
     milvus_upsert_batch_size: int = Form(256),
     job_id: Optional[str] = Form(None),
+    doc_date: Optional[str] = Form(None),
+    doc_section: str = Form(""),
 ) -> JSONResponse:
     """
     Same pipeline as the Streamlit ingest tab: Milvus upsert + MinIO artifacts + Redis status.
@@ -977,6 +1145,8 @@ async def ingest_rag(
             milvus_hnsw_m=milvus_hnsw_m,
             milvus_hnsw_ef_construction=milvus_hnsw_ef_construction,
             milvus_upsert_batch_size=milvus_upsert_batch_size,
+            doc_date=doc_date,
+            doc_section=doc_section,
         )
         jid = (job_id or "").strip() or None
 

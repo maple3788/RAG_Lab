@@ -73,4 +73,3 @@ def deserialize_faiss_index(data: bytes | np.ndarray) -> FaissIndex:
     idx = faiss.deserialize_index(data)
     dim = int(idx.d)
     return FaissIndex(index=idx, dim=dim)
-

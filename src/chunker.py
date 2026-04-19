@@ -77,4 +77,3 @@ def chunk_documents(
 
 def chunks_to_texts(chunks: Iterable[Chunk]) -> List[str]:
     return [c.text for c in chunks]
-

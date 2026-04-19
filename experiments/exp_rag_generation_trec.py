@@ -43,7 +43,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=["compare-rerank", "compare-topk", "compare-prompts", "compare-truncation", "all"],
+        choices=[
+            "compare-rerank",
+            "compare-topk",
+            "compare-prompts",
+            "compare-truncation",
+            "all",
+        ],
         default="all",
     )
     parser.add_argument(
@@ -59,7 +65,9 @@ def main() -> None:
     parser.add_argument("--final-k", type=int, default=3)
     parser.add_argument("--max-context-chars", type=int, default=6000)
     parser.add_argument("--truncation-chars", type=int, default=1200)
-    parser.add_argument("--truncation", default="head", choices=("head", "tail", "middle"))
+    parser.add_argument(
+        "--truncation", default="head", choices=("head", "tail", "middle")
+    )
     parser.add_argument("--chunk-size", type=int, default=512)
     parser.add_argument("--chunk-overlap", type=int, default=64)
     parser.add_argument(
@@ -151,12 +159,28 @@ def main() -> None:
     all_rows = []
     if args.mode in ("compare-rerank", "all"):
         all_rows.extend(
-            run_compare_rerank(embedder, corpus_chunks, examples, generator, base, reranker, faiss_index)
+            run_compare_rerank(
+                embedder,
+                corpus_chunks,
+                examples,
+                generator,
+                base,
+                reranker,
+                faiss_index,
+            )
         )
     if args.mode in ("compare-topk", "all"):
-        all_rows.extend(run_compare_topk(embedder, corpus_chunks, examples, generator, base, faiss_index))
+        all_rows.extend(
+            run_compare_topk(
+                embedder, corpus_chunks, examples, generator, base, faiss_index
+            )
+        )
     if args.mode in ("compare-prompts", "all"):
-        all_rows.extend(run_compare_prompts(embedder, corpus_chunks, examples, generator, base, faiss_index))
+        all_rows.extend(
+            run_compare_prompts(
+                embedder, corpus_chunks, examples, generator, base, faiss_index
+            )
+        )
     if args.mode in ("compare-truncation", "all"):
         all_rows.extend(
             run_compare_truncation(

@@ -91,6 +91,5 @@ def load_beir_queries_as_qa_examples(
         examples = raw
 
     if max_queries is not None:
-        examples = examples[: max_queries]
+        examples = examples[:max_queries]
     return examples
-

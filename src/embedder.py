@@ -65,4 +65,3 @@ def prepare_passage(model_name: str, passage: str) -> str:
 
 def prepare_passages(model_name: str, passages: Iterable[str]) -> List[str]:
     return [prepare_passage(model_name, p) for p in passages]
-

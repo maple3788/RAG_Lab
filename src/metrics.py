@@ -42,9 +42,7 @@ def compute_answer_metrics(prediction: str, reference: str) -> dict[str, float]:
     }
 
 
-def retrieval_recall_proxy(
-    retrieved_texts: Sequence[str], ground_truth: str
-) -> float:
+def retrieval_recall_proxy(retrieved_texts: Sequence[str], ground_truth: str) -> float:
     """Alias for dashboards that want an explicit retrieval-quality signal."""
     return recall_at_k(retrieved_texts, ground_truth)
 
@@ -73,4 +71,3 @@ def composite_ragas_score(scores: Mapping[str, Any]) -> Optional[float]:
     if not vals:
         return None
     return mean(vals)
-

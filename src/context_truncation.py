@@ -5,7 +5,9 @@ from typing import Literal
 TruncationStrategy = Literal["head", "tail", "middle"]
 
 
-def truncate_context(text: str, max_chars: int, strategy: TruncationStrategy = "head") -> str:
+def truncate_context(
+    text: str, max_chars: int, strategy: TruncationStrategy = "head"
+) -> str:
     """
     Truncate a single concatenated context string to fit a budget (char-level proxy for window).
     - head: keep the start

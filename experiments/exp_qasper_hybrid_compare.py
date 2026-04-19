@@ -150,7 +150,9 @@ def run_retrieval_compare(
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="QASPER dense vs hybrid retrieval / RAG compare")
+    p = argparse.ArgumentParser(
+        description="QASPER dense vs hybrid retrieval / RAG compare"
+    )
     p.add_argument(
         "--mode",
         choices=("retrieval", "generation"),
@@ -175,7 +177,9 @@ def main() -> None:
     p.add_argument("--dataset-revision", default=DEFAULT_QASPER_REVISION)
     p.add_argument("--use-rerank", action="store_true")
     p.add_argument("--rerank-model", default="BAAI/bge-reranker-base")
-    p.add_argument("--llm-backend", choices=("gemini", "openai", "ollama"), default="gemini")
+    p.add_argument(
+        "--llm-backend", choices=("gemini", "openai", "ollama"), default="gemini"
+    )
     p.add_argument("--llm-model", default=None)
     p.add_argument("--mock-generation", action="store_true")
     p.add_argument("--max-context-chars", type=int, default=8000)

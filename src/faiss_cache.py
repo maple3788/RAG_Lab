@@ -99,8 +99,10 @@ def try_load_doc_level_cache(
     doc_ids: Sequence[str],
     normalize_embeddings: bool,
 ) -> FaissIndex | None:
-    mp, ip, yp = _meta_path(cache_dir, stem), _index_path(cache_dir, stem), _ids_path(
-        cache_dir, stem
+    mp, ip, yp = (
+        _meta_path(cache_dir, stem),
+        _index_path(cache_dir, stem),
+        _ids_path(cache_dir, stem),
     )
     if not (mp.is_file() and ip.is_file() and yp.is_file()):
         return None
@@ -128,7 +130,11 @@ def try_load_doc_level_cache(
         return None
     dim = int(idx.d)
     nvec = int(idx.ntotal)
-    if meta.get("dim") != dim or meta.get("n_vectors") != nvec or nvec != len(cached_ids):
+    if (
+        meta.get("dim") != dim
+        or meta.get("n_vectors") != nvec
+        or nvec != len(cached_ids)
+    ):
         return None
     return FaissIndex(index=idx, dim=dim)
 
@@ -177,8 +183,10 @@ def try_load_chunk_cache(
     chunk_overlap: int,
     normalize_embeddings: bool,
 ) -> FaissIndex | None:
-    mp, ip, yp = _meta_path(cache_dir, stem), _index_path(cache_dir, stem), _ids_path(
-        cache_dir, stem
+    mp, ip, yp = (
+        _meta_path(cache_dir, stem),
+        _index_path(cache_dir, stem),
+        _ids_path(cache_dir, stem),
     )
     if not (mp.is_file() and ip.is_file() and yp.is_file()):
         return None
@@ -208,6 +216,10 @@ def try_load_chunk_cache(
         return None
     dim = int(idx.d)
     nvec = int(idx.ntotal)
-    if meta.get("dim") != dim or meta.get("n_vectors") != nvec or nvec != len(cached_parents):
+    if (
+        meta.get("dim") != dim
+        or meta.get("n_vectors") != nvec
+        or nvec != len(cached_parents)
+    ):
         return None
     return FaissIndex(index=idx, dim=dim)

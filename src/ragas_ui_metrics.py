@@ -89,7 +89,11 @@ def build_langchain_ragas_eval_stack(
         em = embed_model
 
     if backend == "ollama":
-        base = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1").strip().rstrip("/")
+        base = (
+            os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1")
+            .strip()
+            .rstrip("/")
+        )
         if not base.endswith("/v1"):
             base = f"{base}/v1"
         os.environ.setdefault("OPENAI_API_KEY", "ollama")
@@ -98,7 +102,9 @@ def build_langchain_ragas_eval_stack(
         os.environ.setdefault("OPENAI_EMBEDDING_MODEL", em)
         # RAGAS pydantic prompts use ``model_validate_json()`` on completions. Local models
         # often emit markdown or prose unless JSON is forced (same class of issue as Gemini).
-        ollama_json = os.environ.get("RAGAS_OLLAMA_JSON_MODE", "1").strip().lower() not in (
+        ollama_json = os.environ.get(
+            "RAGAS_OLLAMA_JSON_MODE", "1"
+        ).strip().lower() not in (
             "0",
             "false",
             "no",
@@ -148,7 +154,9 @@ def build_langchain_ragas_eval_stack(
         api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key:
             raise ValueError("GEMINI_API_KEY is required for gemini RAGAS evaluator.")
-        json_mode = os.environ.get("RAGAS_GEMINI_JSON_MODE", "1").strip().lower() not in (
+        json_mode = os.environ.get(
+            "RAGAS_GEMINI_JSON_MODE", "1"
+        ).strip().lower() not in (
             "0",
             "false",
             "no",
@@ -197,7 +205,9 @@ def build_langchain_ragas_eval_stack(
         )
 
     wrapped_emb = LangchainEmbeddingsWrapper(lc_emb) if lc_emb is not None else None
-    _log.info("RAGAS: LangChain eval stack ready (embeddings=%s)", wrapped_emb is not None)
+    _log.info(
+        "RAGAS: LangChain eval stack ready (embeddings=%s)", wrapped_emb is not None
+    )
     return LangchainLLMWrapper(lc_llm), wrapped_emb
 
 
@@ -246,7 +256,10 @@ def _eval_result_first_row(
             except (TypeError, ValueError):
                 return None, f"non-numeric {col}: {v!r}"
             if not math.isfinite(x):
-                return None, "non-finite score (often LLM parse failure — try another model or backend)"
+                return (
+                    None,
+                    "non-finite score (often LLM parse failure — try another model or backend)",
+                )
             return x, None
     return None, f"no column in {col_candidates!r} (got {list(df.columns)})"
 
@@ -329,7 +342,8 @@ def run_ragas_legacy_evaluate(
             "LLMContextPrecisionWithoutReference",
         )
         ctx_result_names = [
-            getattr(ctx_metric, "name", None) or "llm_context_precision_without_reference",
+            getattr(ctx_metric, "name", None)
+            or "llm_context_precision_without_reference",
             "llm_context_precision_without_reference",
         ]
 
@@ -373,7 +387,9 @@ def run_ragas_legacy_evaluate(
     if cr_err:
         out["context_relevance_error"] = cr_err
     if not has_ref:
-        out["context_relevance_note"] = "LLM context precision (no reference; add reference for context_precision)"
+        out["context_relevance_note"] = (
+            "LLM context precision (no reference; add reference for context_precision)"
+        )
 
     if has_ref:
         aa_val, aa_err = _eval_result_first_row(result, ["answer_correctness"])
@@ -404,7 +420,10 @@ def _metric_value_to_float(mr: Any) -> Tuple[Optional[float], Optional[str]]:
     except (TypeError, ValueError):
         return None, f"non-numeric value: {v!r}"
     if not math.isfinite(x):
-        return None, "non-finite score (often LLM/judge parse failure — try another model or backend)"
+        return (
+            None,
+            "non-finite score (often LLM/judge parse failure — try another model or backend)",
+        )
     return x, None
 
 
@@ -435,7 +454,11 @@ def make_ragas_instructor_llm(backend: str, model: str) -> Any:
     if backend == "mock":
         raise ValueError("RAGAS requires a real LLM backend (not mock).")
     if backend == "ollama":
-        base = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1").strip().rstrip("/")
+        base = (
+            os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1")
+            .strip()
+            .rstrip("/")
+        )
         if not base.endswith("/v1"):
             base = f"{base}/v1"
         client = OpenAI(base_url=base, api_key="ollama")
@@ -445,7 +468,11 @@ def make_ragas_instructor_llm(backend: str, model: str) -> Any:
         if not api_key:
             raise ValueError("OPENAI_API_KEY is not set.")
         base_url = os.environ.get("OPENAI_BASE_URL")
-        client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
+        client = (
+            OpenAI(api_key=api_key, base_url=base_url)
+            if base_url
+            else OpenAI(api_key=api_key)
+        )
         return llm_factory(model, provider="openai", client=client)
     if backend == "gemini":
         api_key = os.environ.get("GEMINI_API_KEY")
@@ -471,7 +498,11 @@ def run_ragas_collections_metrics(
     Returns dict with float scores 0–1 and optional per-metric ``*_error`` strings.
     Keys: ``context_relevance``, ``response_groundedness``, ``answer_accuracy`` (may be None).
     """
-    from ragas.metrics.collections import AnswerAccuracy, ContextRelevance, ResponseGroundedness
+    from ragas.metrics.collections import (
+        AnswerAccuracy,
+        ContextRelevance,
+        ResponseGroundedness,
+    )
 
     if not retrieved_contexts:
         return {
@@ -486,7 +517,9 @@ def run_ragas_collections_metrics(
     try:
         cr = ContextRelevance(llm=llm)
         cr_val, cr_err = _metric_value_to_float(
-            _metric_score_safe(cr, user_input=user_input, retrieved_contexts=retrieved_contexts)
+            _metric_score_safe(
+                cr, user_input=user_input, retrieved_contexts=retrieved_contexts
+            )
         )
         out["context_relevance"] = cr_val
         if cr_err:
@@ -498,7 +531,9 @@ def run_ragas_collections_metrics(
     try:
         rg = ResponseGroundedness(llm=llm)
         rg_val, rg_err = _metric_value_to_float(
-            _metric_score_safe(rg, response=response, retrieved_contexts=retrieved_contexts)
+            _metric_score_safe(
+                rg, response=response, retrieved_contexts=retrieved_contexts
+            )
         )
         out["response_groundedness"] = rg_val
         if rg_err:

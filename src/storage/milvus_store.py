@@ -7,6 +7,14 @@ from typing import Any, List, Optional
 from dotenv import load_dotenv
 
 from src.embedder import EmbeddingModel, prepare_passage, prepare_query
+from src.milvus_metadata import (
+    DEFAULT_SECTION,
+    FIELD_DOC_DATE,
+    FIELD_SECTION,
+    FIELD_SOURCE_TYPE,
+    UNKNOWN_DOC_DATE,
+    combine_job_filter_with_metadata,
+)
 
 
 @dataclass(frozen=True)
@@ -67,6 +75,9 @@ class MilvusChunkStore:
     - chunk_index: int
     - text: str
     - vector: float[]
+    - doc_date: str (``YYYY-MM-DD`` or ``unknown``)
+    - section: str (e.g. ``document`` when not structure-aware)
+    - source_type: str (e.g. ``pdf``, ``txt``)
     """
 
     def __init__(self, settings: Optional[MilvusSettings] = None):
@@ -104,7 +115,9 @@ class MilvusChunkStore:
     def _collection_name(self, collection_name: Optional[str] = None) -> str:
         return (collection_name or self.settings.collection).strip()
 
-    def _ensure_collection(self, dim: int, *, metric_type: str, collection_name: Optional[str] = None) -> None:
+    def _ensure_collection(
+        self, dim: int, *, metric_type: str, collection_name: Optional[str] = None
+    ) -> None:
         name = self._collection_name(collection_name)
         if self._client.has_collection(collection_name=name):
             return
@@ -121,7 +134,9 @@ class MilvusChunkStore:
             enable_dynamic_field=True,
         )
 
-    def _ensure_index(self, cfg: MilvusIndexConfig, *, collection_name: Optional[str] = None) -> None:
+    def _ensure_index(
+        self, cfg: MilvusIndexConfig, *, collection_name: Optional[str] = None
+    ) -> None:
         name = self._collection_name(collection_name)
         params = self._index_params_for(cfg)
         # Milvus allows one distinct index per vector field. If an index already
@@ -157,7 +172,9 @@ class MilvusChunkStore:
             # Some configurations auto-index; keep ingest robust.
             return
 
-    def describe_collection(self, *, collection_name: Optional[str] = None) -> dict[str, Any]:
+    def describe_collection(
+        self, *, collection_name: Optional[str] = None
+    ) -> dict[str, Any]:
         """
         Return live collection/index metadata for debugging UI.
         """
@@ -194,7 +211,9 @@ class MilvusChunkStore:
         except Exception:
             return []
 
-    def load_collection(self, *, collection_name: Optional[str] = None, release_others: bool = False) -> dict[str, Any]:
+    def load_collection(
+        self, *, collection_name: Optional[str] = None, release_others: bool = False
+    ) -> dict[str, Any]:
         """
         Load one collection for search. Optionally release all other loaded collections.
         """
@@ -236,6 +255,7 @@ class MilvusChunkStore:
         batch_size: int = 256,
         index_config: Optional[MilvusIndexConfig] = None,
         collection_name: Optional[str] = None,
+        chunk_metadatas: Optional[List[dict[str, str]]] = None,
     ) -> int:
         if not chunk_texts:
             return 0
@@ -244,11 +264,27 @@ class MilvusChunkStore:
         dim = int(vecs.shape[1])
         idx_cfg = index_config or MilvusIndexConfig()
         target = self._collection_name(collection_name)
-        self._ensure_collection(dim, metric_type=idx_cfg.metric_type, collection_name=target)
+        self._ensure_collection(
+            dim, metric_type=idx_cfg.metric_type, collection_name=target
+        )
         self._ensure_index(idx_cfg, collection_name=target)
 
         rows = []
         for i, text in enumerate(chunk_texts):
+            meta: dict[str, str]
+            if chunk_metadatas is not None and i < len(chunk_metadatas):
+                m = chunk_metadatas[i]
+                meta = {
+                    FIELD_DOC_DATE: str(m.get(FIELD_DOC_DATE, UNKNOWN_DOC_DATE)),
+                    FIELD_SECTION: str(m.get(FIELD_SECTION, DEFAULT_SECTION)),
+                    FIELD_SOURCE_TYPE: str(m.get(FIELD_SOURCE_TYPE, "other")),
+                }
+            else:
+                meta = {
+                    FIELD_DOC_DATE: UNKNOWN_DOC_DATE,
+                    FIELD_SECTION: DEFAULT_SECTION,
+                    FIELD_SOURCE_TYPE: "other",
+                }
             rows.append(
                 {
                     "id": self._stable_id(job_id, i),
@@ -256,6 +292,7 @@ class MilvusChunkStore:
                     "chunk_index": i,
                     "text": text,
                     "vector": vecs[i].tolist(),
+                    **meta,
                 }
             )
         name = target
@@ -277,6 +314,7 @@ class MilvusChunkStore:
         search_config: Optional[MilvusSearchConfig] = None,
         index_type: str = "AUTOINDEX",
         collection_name: Optional[str] = None,
+        metadata_filter_expr: Optional[str] = None,
     ) -> List[dict]:
         if top_k <= 0:
             return []
@@ -286,7 +324,9 @@ class MilvusChunkStore:
         q = prepare_query(embedder.name, query)
         q_vec = embedder.encode([q])[0].tolist()
         # Collection is created on first upsert; search before any sync had no collection.
-        self._ensure_collection(len(q_vec), metric_type=s_cfg.metric_type, collection_name=target)
+        self._ensure_collection(
+            len(q_vec), metric_type=s_cfg.metric_type, collection_name=target
+        )
         search_params: dict[str, Any] = {
             "metric_type": (s_cfg.metric_type or "COSINE").upper(),
             "params": {},
@@ -295,12 +335,22 @@ class MilvusChunkStore:
             search_params["params"] = {"nprobe": int(s_cfg.ivf_nprobe)}
         elif idx_type == "HNSW":
             search_params["params"] = {"ef": int(s_cfg.hnsw_ef)}
+        flt = combine_job_filter_with_metadata(
+            f'job_id == "{job_id}"', metadata_filter_expr
+        )
         out = self._client.search(
             collection_name=target,
             data=[q_vec],
-            filter=f'job_id == "{job_id}"',
+            filter=flt,
             limit=int(top_k),
-            output_fields=["job_id", "chunk_index", "text"],
+            output_fields=[
+                "job_id",
+                "chunk_index",
+                "text",
+                FIELD_DOC_DATE,
+                FIELD_SECTION,
+                FIELD_SOURCE_TYPE,
+            ],
             search_params=search_params,
         )
         hits = out[0] if out else []
@@ -315,6 +365,9 @@ class MilvusChunkStore:
                     "faiss_score": float(h.get("distance", 0.0)),
                     "text": str(ent.get("text", "")),
                     "job_id": str(ent.get("job_id", job_id)),
+                    FIELD_DOC_DATE: str(ent.get(FIELD_DOC_DATE, UNKNOWN_DOC_DATE)),
+                    FIELD_SECTION: str(ent.get(FIELD_SECTION, DEFAULT_SECTION)),
+                    FIELD_SOURCE_TYPE: str(ent.get(FIELD_SOURCE_TYPE, "other")),
                 }
             )
         return rows
@@ -342,6 +395,7 @@ class MilvusChunkStore:
         search_config: Optional[MilvusSearchConfig] = None,
         index_type: str = "AUTOINDEX",
         collection_name: Optional[str] = None,
+        metadata_filter_expr: Optional[str] = None,
     ) -> List[dict]:
         """
         Vector search restricted to rows whose ``job_id`` is one of ``job_ids`` (same Milvus collection).
@@ -357,14 +411,19 @@ class MilvusChunkStore:
                 search_config=search_config,
                 index_type=index_type,
                 collection_name=collection_name,
+                metadata_filter_expr=metadata_filter_expr,
             )
         s_cfg = search_config or MilvusSearchConfig()
         idx_type = (index_type or "AUTOINDEX").upper()
         target = self._collection_name(collection_name)
-        flt = self._filter_for_job_ids(job_ids)
+        flt = combine_job_filter_with_metadata(
+            self._filter_for_job_ids(job_ids), metadata_filter_expr
+        )
         q = prepare_query(embedder.name, query)
         q_vec = embedder.encode([q])[0].tolist()
-        self._ensure_collection(len(q_vec), metric_type=s_cfg.metric_type, collection_name=target)
+        self._ensure_collection(
+            len(q_vec), metric_type=s_cfg.metric_type, collection_name=target
+        )
         search_params: dict[str, Any] = {
             "metric_type": (s_cfg.metric_type or "COSINE").upper(),
             "params": {},
@@ -378,7 +437,14 @@ class MilvusChunkStore:
             data=[q_vec],
             filter=flt,
             limit=int(top_k),
-            output_fields=["job_id", "chunk_index", "text"],
+            output_fields=[
+                "job_id",
+                "chunk_index",
+                "text",
+                FIELD_DOC_DATE,
+                FIELD_SECTION,
+                FIELD_SOURCE_TYPE,
+            ],
             search_params=search_params,
         )
         hits = out[0] if out else []
@@ -393,6 +459,9 @@ class MilvusChunkStore:
                     "faiss_score": float(h.get("distance", 0.0)),
                     "text": str(ent.get("text", "")),
                     "job_id": str(ent.get("job_id", "")),
+                    FIELD_DOC_DATE: str(ent.get(FIELD_DOC_DATE, UNKNOWN_DOC_DATE)),
+                    FIELD_SECTION: str(ent.get(FIELD_SECTION, DEFAULT_SECTION)),
+                    FIELD_SOURCE_TYPE: str(ent.get(FIELD_SOURCE_TYPE, "other")),
                 }
             )
         return rows

@@ -32,4 +32,3 @@ def load_reranker(model_name: str, *, device: str | None = None) -> Reranker:
         kwargs["device"] = device
     model = CrossEncoder(model_name, **kwargs)
     return Reranker(name=model_name, model=model)
-

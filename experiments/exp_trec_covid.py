@@ -34,7 +34,12 @@ from src.beir_io import (
     ordered_qids_from_qrels,
 )
 from src.chunker import chunk_text
-from src.embedder import EmbeddingModel, load_embedding_model, prepare_passages, prepare_query
+from src.embedder import (
+    EmbeddingModel,
+    load_embedding_model,
+    prepare_passages,
+    prepare_query,
+)
 from src.faiss_cache import (
     corpus_fingerprint,
     save_chunk_cache,
@@ -125,7 +130,9 @@ def run_doc_level(
     cache_dir: Path | None = None,
 ) -> List[ScoredDoc]:
     if corpus_path is None:
-        raise ValueError("corpus_path is required for indexing (use data-dir / corpus.jsonl)")
+        raise ValueError(
+            "corpus_path is required for indexing (use data-dir / corpus.jsonl)"
+        )
     faiss_index = _build_or_load_doc_index(
         embedder,
         doc_ids,
@@ -208,7 +215,9 @@ def run_chunked_doc_pool(
             print(
                 f"Encoding {len(passages)} chunks (size={chunk_size}, overlap={chunk_overlap})…"
             )
-            emb = embedder.encode(passages, batch_size=batch_size, show_progress_bar=True)
+            emb = embedder.encode(
+                passages, batch_size=batch_size, show_progress_bar=True
+            )
             faiss_index = build_faiss_index(emb)
             save_chunk_cache(
                 cache_dir,
@@ -225,7 +234,9 @@ def run_chunked_doc_pool(
             print(f"Saved chunk FAISS cache ({stem}).")
     else:
         passages = prepare_passages(embedder.name, chunk_texts)
-        print(f"Encoding {len(passages)} chunks (size={chunk_size}, overlap={chunk_overlap})…")
+        print(
+            f"Encoding {len(passages)} chunks (size={chunk_size}, overlap={chunk_overlap})…"
+        )
         emb = embedder.encode(passages, batch_size=batch_size, show_progress_bar=True)
         faiss_index = build_faiss_index(emb)
 
@@ -268,7 +279,9 @@ def run_with_rerank(
     cache_dir: Path | None = None,
 ) -> List[ScoredDoc]:
     if corpus_path is None:
-        raise ValueError("corpus_path is required for indexing (use data-dir / corpus.jsonl)")
+        raise ValueError(
+            "corpus_path is required for indexing (use data-dir / corpus.jsonl)"
+        )
     faiss_index = _build_or_load_doc_index(
         embedder,
         doc_ids,
@@ -323,7 +336,11 @@ def load_beir_split(args: argparse.Namespace) -> Tuple:
     queries_path = data_dir / "queries.jsonl"
     qrels_path = data_dir / args.qrels_file
 
-    if not corpus_path.is_file() or not queries_path.is_file() or not qrels_path.is_file():
+    if (
+        not corpus_path.is_file()
+        or not queries_path.is_file()
+        or not qrels_path.is_file()
+    ):
         print(
             "Missing BEIR TREC-COVID files.\n"
             f"Expected:\n  {corpus_path}\n  {queries_path}\n  {qrels_path}\n\n"
@@ -498,7 +515,9 @@ def main() -> None:
             rows = []
             for model_name in args.embedding_models:
                 print(f"\n=== Embedding model: {model_name} ===")
-                emb = load_embedding_model(model_name, normalize=True, device=args.device)
+                emb = load_embedding_model(
+                    model_name, normalize=True, device=args.device
+                )
                 run = run_doc_level(
                     emb,
                     doc_ids,
@@ -594,7 +613,10 @@ def main() -> None:
 
             rows = [
                 _metrics_to_row(
-                    {"setting": "bi_encoder_only", "embedding_model": args.embedding_model},
+                    {
+                        "setting": "bi_encoder_only",
+                        "embedding_model": args.embedding_model,
+                    },
                     res_base,
                 ),
                 _metrics_to_row(

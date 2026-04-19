@@ -24,7 +24,12 @@ from src.error_analysis import (
     gold_in_any_chunk,
     gold_lost_to_truncation,
 )
-from src.generator import GeminiGenerator, MockGenerator, OllamaGenerator, OpenAICompatibleGenerator
+from src.generator import (
+    GeminiGenerator,
+    MockGenerator,
+    OllamaGenerator,
+    OpenAICompatibleGenerator,
+)
 from src.loader import QAExample
 from src.prompts import PROMPT_TEMPLATES, format_rag_prompt
 from src.rag_generation import passages_to_context
@@ -70,11 +75,15 @@ def main() -> None:
     p.add_argument("--chunk-overlap", type=int, default=48)
     p.add_argument("--max-context-chars", type=int, default=8000)
     p.add_argument("--truncation", default="head", choices=("head", "tail", "middle"))
-    p.add_argument("--prompt-name", default="default", choices=tuple(PROMPT_TEMPLATES.keys()))
+    p.add_argument(
+        "--prompt-name", default="default", choices=tuple(PROMPT_TEMPLATES.keys())
+    )
     p.add_argument("--use-rerank", action="store_true")
     p.add_argument("--skip-generation", action="store_true")
     p.add_argument("--mock-generation", action="store_true")
-    p.add_argument("--llm-backend", choices=("gemini", "openai", "ollama"), default="ollama")
+    p.add_argument(
+        "--llm-backend", choices=("gemini", "openai", "ollama"), default="ollama"
+    )
     p.add_argument("--llm-model", default=None)
     p.add_argument("--preview-chars", type=int, default=400)
     args = p.parse_args()
@@ -147,12 +156,18 @@ def main() -> None:
 
             prediction = ""
             if not args.skip_generation and generator is not None:
-                prompt = format_rag_prompt(tmpl, context=trunc_ctx, question=ex.question)
+                prompt = format_rag_prompt(
+                    tmpl, context=trunc_ctx, question=ex.question
+                )
                 prediction = generator.generate(prompt)
 
             em = max(exact_match(prediction, g) for g in golds) if prediction else 0.0
             f1 = max(token_f1(prediction, g) for g in golds) if prediction else 0.0
-            gh = max(gold_answer_hit(prediction, g) for g in golds) if prediction else 0.0
+            gh = (
+                max(gold_answer_hit(prediction, g) for g in golds)
+                if prediction
+                else 0.0
+            )
 
             if not any_pool:
                 stage = "retrieval"

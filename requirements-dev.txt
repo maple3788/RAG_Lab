@@ -1,0 +1,2 @@
+# Development tooling (optional): pip install -r requirements-dev.txt
+black>=24.8.0

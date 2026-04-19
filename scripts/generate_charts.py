@@ -65,8 +65,24 @@ def chart_topk(df: pd.DataFrame, out: Path) -> None:
     sub = sub.sort_values("k")
     ks = sub["k"].tolist()
     fig, ax = plt.subplots(figsize=(7, 4.2))
-    ax.plot(ks, sub["token_f1"], "o-", color=COL_F1, linewidth=2, markersize=8, label="Token F1")
-    ax.plot(ks, sub["gold_hit"], "s-", color=COL_GH, linewidth=2, markersize=8, label="Gold hit")
+    ax.plot(
+        ks,
+        sub["token_f1"],
+        "o-",
+        color=COL_F1,
+        linewidth=2,
+        markersize=8,
+        label="Token F1",
+    )
+    ax.plot(
+        ks,
+        sub["gold_hit"],
+        "s-",
+        color=COL_GH,
+        linewidth=2,
+        markersize=8,
+        label="Gold hit",
+    )
     ax.set_xticks(ks)
     ax.set_xlabel("final_k (passages to LLM)")
     ax.set_ylabel("Score")
@@ -95,7 +111,9 @@ def chart_truncation(df: pd.DataFrame, out: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate QASPER README charts")
-    parser.add_argument("--csv", type=Path, default=Path("results/qasper_rag_generation_results.csv"))
+    parser.add_argument(
+        "--csv", type=Path, default=Path("results/qasper_rag_generation_results.csv")
+    )
     parser.add_argument("--out-dir", type=Path, default=Path("assets"))
     args = parser.parse_args()
 

@@ -59,7 +59,9 @@ def main() -> None:
     parser.add_argument("--final-k", type=int, default=3)
     parser.add_argument("--max-context-chars", type=int, default=7000)
     parser.add_argument("--truncation-chars", type=int, default=1400)
-    parser.add_argument("--truncation", default="head", choices=("head", "tail", "middle"))
+    parser.add_argument(
+        "--truncation", default="head", choices=("head", "tail", "middle")
+    )
     parser.add_argument("--chunk-size", type=int, default=384)
     parser.add_argument("--chunk-overlap", type=int, default=48)
     parser.add_argument("--max-examples", type=int, default=None)
@@ -87,7 +89,9 @@ def main() -> None:
     )
     print(f"Examples loaded: {len(examples)}")
     if not examples:
-        raise SystemExit("No examples loaded (need question, answer, and evidence contexts).")
+        raise SystemExit(
+            "No examples loaded (need question, answer, and evidence contexts)."
+        )
 
     out_dir = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -119,12 +123,20 @@ def main() -> None:
     if args.mode in ("compare-rerank", "all"):
         all_rows.extend(
             run_compare_rerank(
-                embedder, corpus_chunks, examples, generator, base, reranker, faiss_index
+                embedder,
+                corpus_chunks,
+                examples,
+                generator,
+                base,
+                reranker,
+                faiss_index,
             )
         )
     if args.mode in ("compare-topk", "all"):
         all_rows.extend(
-            run_compare_topk(embedder, corpus_chunks, examples, generator, base, faiss_index)
+            run_compare_topk(
+                embedder, corpus_chunks, examples, generator, base, faiss_index
+            )
         )
     if args.mode in ("compare-prompts", "all"):
         all_rows.extend(
@@ -153,4 +165,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

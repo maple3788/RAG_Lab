@@ -46,7 +46,12 @@ def main() -> None:
         top_k=rerank_top_k,
         reranker=None,
     )
-    rows.append({"setting": "no_rerank", f"recall@{rerank_top_k}": no_rerank[f"recall@{rerank_top_k}"]})
+    rows.append(
+        {
+            "setting": "no_rerank",
+            f"recall@{rerank_top_k}": no_rerank[f"recall@{rerank_top_k}"],
+        }
+    )
     print("no_rerank", no_rerank)
 
     reranker = load_reranker(rerank_model)
@@ -58,7 +63,12 @@ def main() -> None:
         reranker=reranker,
         rerank_top_k=rerank_top_k,
     )
-    rows.append({"setting": "bge_reranker", f"recall@{rerank_top_k}": with_rerank[f"recall@{rerank_top_k}"]})
+    rows.append(
+        {
+            "setting": "bge_reranker",
+            f"recall@{rerank_top_k}": with_rerank[f"recall@{rerank_top_k}"],
+        }
+    )
     print("with_rerank", with_rerank)
 
     df = pd.DataFrame(rows)
@@ -79,4 +89,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

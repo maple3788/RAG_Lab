@@ -17,7 +17,9 @@ def _tokens(text: str) -> List[str]:
 
 
 def exact_match(prediction: str, ground_truth: str) -> float:
-    return 1.0 if _normalize_answer(prediction) == _normalize_answer(ground_truth) else 0.0
+    return (
+        1.0 if _normalize_answer(prediction) == _normalize_answer(ground_truth) else 0.0
+    )
 
 
 def token_f1(prediction: str, ground_truth: str) -> float:

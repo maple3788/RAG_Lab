@@ -7,6 +7,43 @@ import re
 from typing import Iterable, List, Optional
 
 
+def try_pdf_metadata_iso_date(data: bytes) -> Optional[str]:
+    """
+    Best-effort ``YYYY-MM-DD`` from PDF ``/CreationDate`` or ``/ModDate`` metadata.
+    Returns ``None`` if unavailable or unparseable.
+    """
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        return None
+    try:
+        import io
+
+        reader = PdfReader(io.BytesIO(data))
+        meta = reader.metadata
+        if not meta:
+            return None
+        for key in ("/CreationDate", "/ModDate"):
+            raw = meta.get(key)
+            if raw:
+                parsed = _parse_pdf_date_string(str(raw))
+                if parsed:
+                    return parsed
+    except Exception:
+        return None
+    return None
+
+
+def _parse_pdf_date_string(s: str) -> Optional[str]:
+    """
+    PDF dates look like ``D:20230102150400+01'00`` or ``D:20230102``.
+    """
+    m = re.search(r"D:(\d{4})(\d{2})(\d{2})", s)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    return None
+
+
 def extract_text_from_bytes(name: str, data: bytes) -> str:
     lower = name.lower()
     if lower.endswith(".pdf"):

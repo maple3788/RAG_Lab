@@ -120,9 +120,7 @@ def fused_top_indices(
     dense_ranks = _dense_ranked_indices(
         question, embedder, faiss_index, corpus_chunks, top_k=k_lists
     )
-    bm25_ranks = _bm25_ranked_indices(
-        question, bm25_resources, n, top_k=k_lists
-    )
+    bm25_ranks = _bm25_ranked_indices(question, bm25_resources, n, top_k=k_lists)
     return reciprocal_rank_fusion(
         [dense_ranks, bm25_ranks],
         rrf_k=rrf_k,
@@ -175,7 +173,9 @@ def fuse_milvus_dense_order_with_bm25(
     bm25_resources = build_bm25_resources(corpus_chunks)
     k_lists = min(int(fusion_list_k), n)
     k_out = min(int(retrieve_k), n)
-    dense_list = [int(i) for i in dense_global_indices_ordered[:k_lists] if 0 <= int(i) < n]
+    dense_list = [
+        int(i) for i in dense_global_indices_ordered[:k_lists] if 0 <= int(i) < n
+    ]
     bm25_list = _bm25_ranked_indices(question, bm25_resources, n, top_k=k_lists)
     return reciprocal_rank_fusion(
         [dense_list, bm25_list],

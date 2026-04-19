@@ -39,7 +39,11 @@ def _fmt_block(title: str, r: dict) -> str:
     if len(aliases) > 5:
         alias_s += f" … (+{len(aliases) - 5} more)"
     finals = r.get("final_previews") or []
-    fp = finals[0][:500] + "…" if finals and len(finals[0]) > 500 else (finals[0] if finals else "")
+    fp = (
+        finals[0][:500] + "…"
+        if finals and len(finals[0]) > 500
+        else (finals[0] if finals else "")
+    )
     return "\n".join(
         [
             f"#### {title}",
@@ -58,7 +62,9 @@ def _fmt_block(title: str, r: dict) -> str:
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--in", dest="in_path", type=Path, default=Path("analysis/qasper_traces.jsonl"))
+    p.add_argument(
+        "--in", dest="in_path", type=Path, default=Path("analysis/qasper_traces.jsonl")
+    )
     p.add_argument("--out", type=Path, default=Path("analysis/error_analysis_draft.md"))
     args = p.parse_args()
 
@@ -73,7 +79,10 @@ def main() -> None:
 
     rows = [r for r in _load_rows(args.in_path) if "error" not in r]
     if not rows:
-        args.out.write_text("# Error analysis draft (QASPER)\n\n*No valid trace rows.*\n", encoding="utf-8")
+        args.out.write_text(
+            "# Error analysis draft (QASPER)\n\n*No valid trace rows.*\n",
+            encoding="utf-8",
+        )
         return
 
     def success_sort_key(r: dict) -> tuple:
@@ -96,7 +105,8 @@ def main() -> None:
         cands = [
             r
             for r in rows
-            if r.get("retrieval_stage") == "gold_in_final" and r.get("failure_bucket") == "generation"
+            if r.get("retrieval_stage") == "gold_in_final"
+            and r.get("failure_bucket") == "generation"
         ]
         return cands[0] if cands else None
 
@@ -128,17 +138,27 @@ def main() -> None:
     lines.extend(["## Failure cases (3)", ""])
 
     if fail_ret:
-        lines.append(_fmt_block("Failure — retrieval (no gold in retrieve_k pool)", fail_ret))
+        lines.append(
+            _fmt_block("Failure — retrieval (no gold in retrieve_k pool)", fail_ret)
+        )
     else:
-        lines.append("*(No retrieval-stage row in this export; increase `--max-examples` or check data.)*\n")
+        lines.append(
+            "*(No retrieval-stage row in this export; increase `--max-examples` or check data.)*\n"
+        )
 
     if fail_rank:
-        lines.append(_fmt_block("Failure — ranking (gold in pool, not in final_k)", fail_rank))
+        lines.append(
+            _fmt_block("Failure — ranking (gold in pool, not in final_k)", fail_rank)
+        )
     else:
         lines.append("*(No ranking-stage row in this export.)*\n")
 
     if fail_gen:
-        lines.append(_fmt_block("Failure — generation (gold in final context, wrong answer)", fail_gen))
+        lines.append(
+            _fmt_block(
+                "Failure — generation (gold in final context, wrong answer)", fail_gen
+            )
+        )
     else:
         lines.append(
             "*(No generation bucket row; run export **with** LLM: omit `--skip-generation`.)*\n"

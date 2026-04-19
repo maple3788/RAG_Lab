@@ -272,4 +272,3 @@ def evaluate_retrieval(
         "n_chunks": float(len(corpus_chunks)),
         "index_dim": float(faiss_index.dim),
     }
-
