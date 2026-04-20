@@ -7,12 +7,13 @@ import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, Optional
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 from prometheus_client import Counter, Histogram, generate_latest
-from starlette.responses import JSONResponse, Response
+from starlette.responses import FileResponse, JSONResponse, Response
 
 from src.rag.context_truncation import truncate_context
 from src.config import (
@@ -156,6 +157,8 @@ class TTLCache:
 
 
 app = FastAPI(title="RAG Lab API", version="0.1.0")
+_api_dir = Path(__file__).resolve().parent
+_tester_ui_path = _api_dir / "static" / "api_tester.html"
 _embedder: Optional[EmbeddingModel] = None
 _reranker: Optional[Reranker] = None
 _milvus: Optional[MilvusChunkStore] = None
@@ -854,6 +857,14 @@ async def readyz() -> dict[str, str]:
 @app.get("/metrics")
 async def metrics() -> Response:
     return Response(content=generate_latest(), media_type="text/plain; version=0.0.4")
+
+
+@app.get("/v1/rag/ui")
+async def api_tester_ui() -> FileResponse:
+    """Lightweight in-app API tester for manual endpoint checks."""
+    if not _tester_ui_path.exists():
+        raise HTTPException(status_code=404, detail="api tester page not found")
+    return FileResponse(_tester_ui_path)
 
 
 @app.post("/v1/rag/query", response_model=QueryResponse)

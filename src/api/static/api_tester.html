@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RAG Lab API Tester</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #0b1020;
+        --panel: #141b2d;
+        --muted: #99a5c2;
+        --text: #edf2ff;
+        --accent: #7aa2ff;
+        --ok: #37d67a;
+        --err: #ff6b6b;
+      }
+      body {
+        margin: 0;
+        font-family:
+          Inter,
+          ui-sans-serif,
+          system-ui,
+          -apple-system,
+          Segoe UI,
+          Roboto,
+          Helvetica,
+          Arial,
+          sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+      .wrap {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 20px;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid #222a40;
+        border-radius: 12px;
+        padding: 16px;
+        margin-bottom: 16px;
+      }
+      h1,
+      h2 {
+        margin: 0 0 10px 0;
+      }
+      .muted {
+        color: var(--muted);
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 140px 1fr;
+        gap: 10px;
+        align-items: center;
+      }
+      input,
+      select,
+      textarea,
+      button {
+        border-radius: 8px;
+        border: 1px solid #2f3854;
+        background: #0e1528;
+        color: var(--text);
+        padding: 8px 10px;
+        font-size: 14px;
+      }
+      textarea {
+        min-height: 130px;
+        width: 100%;
+        resize: vertical;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      button {
+        cursor: pointer;
+        background: #1a2440;
+      }
+      button.primary {
+        background: var(--accent);
+        color: #05102b;
+        border-color: transparent;
+        font-weight: 700;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .status-ok {
+        color: var(--ok);
+      }
+      .status-err {
+        color: var(--err);
+      }
+      pre {
+        margin: 0;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="panel">
+        <h1>RAG Lab API Tester</h1>
+        <p class="muted">
+          Quick manual API checks without leaving your app. Similar purpose to
+          Swagger, but tuned for your common endpoints.
+        </p>
+        <div class="row">
+          <button onclick="applyPreset('healthz')">GET /healthz</button>
+          <button onclick="applyPreset('jobs')">GET /v1/rag/jobs</button>
+          <button onclick="applyPreset('query')">POST /v1/rag/query</button>
+          <button onclick="applyPreset('session')">POST /v1/rag/session</button>
+          <button onclick="applyPreset('load')">POST /v1/rag/load</button>
+          <button onclick="applyPreset('ingest')">POST /v1/rag/ingest</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Request</h2>
+        <div class="grid">
+          <label for="method">Method</label>
+          <select id="method">
+            <option>GET</option>
+            <option>POST</option>
+            <option>DELETE</option>
+          </select>
+
+          <label for="path">Path</label>
+          <input id="path" value="/healthz" />
+
+          <label for="header">Headers (JSON)</label>
+          <textarea id="header">{}</textarea>
+
+          <label for="body">Body (JSON)</label>
+          <textarea id="body">{}</textarea>
+
+          <label for="file">File (for ingest)</label>
+          <input id="file" type="file" />
+        </div>
+        <div class="row" style="margin-top: 12px">
+          <button class="primary" onclick="sendRequest()">Send Request</button>
+          <button onclick="clearOutput()">Clear Output</button>
+          <a href="/docs" class="muted">Open Swagger Docs</a>
+          <a href="/redoc" class="muted">Open ReDoc</a>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Response</h2>
+        <div id="status" class="muted">No request sent yet.</div>
+        <pre id="output" style="margin-top: 10px"></pre>
+      </div>
+    </div>
+
+    <script>
+      const presets = {
+        healthz: { method: "GET", path: "/healthz", body: {}, headers: {} },
+        jobs: { method: "GET", path: "/v1/rag/jobs", body: {}, headers: {} },
+        query: {
+          method: "POST",
+          path: "/v1/rag/query",
+          headers: {},
+          body: {
+            question: "What is this document about?",
+            job_id: "your-job-id",
+            retrieve_k: 12,
+            final_k: 4,
+          },
+        },
+        session: {
+          method: "POST",
+          path: "/v1/rag/session",
+          headers: {},
+          body: { session_id: "dev-session-001", job_id: "your-job-id" },
+        },
+        load: {
+          method: "POST",
+          path: "/v1/rag/load",
+          headers: {},
+          body: { job_id: "your-job-id", release_others: false },
+        },
+        ingest: {
+          method: "POST",
+          path: "/v1/rag/ingest",
+          headers: {},
+          body: {
+            chunk_size: 512,
+            chunk_overlap: 64,
+            extraction: "shallow",
+            summarization: "single",
+          },
+        },
+      };
+
+      function applyPreset(name) {
+        const preset = presets[name];
+        if (!preset) return;
+        document.getElementById("method").value = preset.method;
+        document.getElementById("path").value = preset.path;
+        document.getElementById("header").value = JSON.stringify(
+          preset.headers || {},
+          null,
+          2
+        );
+        document.getElementById("body").value = JSON.stringify(
+          preset.body || {},
+          null,
+          2
+        );
+      }
+
+      function clearOutput() {
+        document.getElementById("status").textContent = "No request sent yet.";
+        document.getElementById("status").className = "muted";
+        document.getElementById("output").textContent = "";
+      }
+
+      function getJsonTextarea(id, fallback) {
+        const raw = document.getElementById(id).value.trim();
+        if (!raw) return fallback;
+        return JSON.parse(raw);
+      }
+
+      async function sendRequest() {
+        const statusEl = document.getElementById("status");
+        const outputEl = document.getElementById("output");
+        statusEl.className = "muted";
+        statusEl.textContent = "Sending...";
+        outputEl.textContent = "";
+
+        try {
+          const started = performance.now();
+          const method = document.getElementById("method").value;
+          const path = document.getElementById("path").value.trim();
+          const headers = getJsonTextarea("header", {});
+          const body = getJsonTextarea("body", {});
+          const fileInput = document.getElementById("file");
+          const hasFile = fileInput.files && fileInput.files.length > 0;
+
+          const opts = { method, headers: { ...headers } };
+          if (method !== "GET" && method !== "DELETE") {
+            if (hasFile && path === "/v1/rag/ingest") {
+              const form = new FormData();
+              form.append("file", fileInput.files[0]);
+              for (const [k, v] of Object.entries(body || {})) {
+                if (v !== null && v !== undefined) {
+                  form.append(k, String(v));
+                }
+              }
+              opts.body = form;
+              delete opts.headers["Content-Type"];
+            } else {
+              opts.headers["Content-Type"] = "application/json";
+              opts.body = JSON.stringify(body);
+            }
+          }
+
+          const res = await fetch(path, opts);
+          const text = await res.text();
+          let parsed = text;
+          try {
+            parsed = JSON.parse(text);
+          } catch (error) {
+            // Keep raw text for non-JSON responses.
+          }
+          const took = performance.now() - started;
+          statusEl.textContent = `${res.status} ${res.statusText}`;
+          statusEl.className = res.ok ? "status-ok" : "status-err";
+          outputEl.textContent = JSON.stringify(
+            {
+              request: { method, path },
+              response: parsed,
+              info: { ok: res.ok, elapsed_ms_approx: Math.round(took) },
+            },
+            null,
+            2
+          );
+        } catch (error) {
+          statusEl.className = "status-err";
+          statusEl.textContent = "Request failed";
+          outputEl.textContent = String(error);
+        }
+      }
+    </script>
+  </body>
+</html>

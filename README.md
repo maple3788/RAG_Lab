@@ -35,6 +35,16 @@ Run Streamlit:
 streamlit run demo/app.py
 ```
 
+Run FastAPI (API + built-in tester UI):
+
+```bash
+uvicorn src.api.server:app --reload --port 8000
+```
+
+Then open:
+- `http://localhost:8000/docs` (Swagger UI)
+- `http://localhost:8000/v1/rag/ui` (lightweight custom API tester)
+
 Optional local services (MinIO + Redis + monitoring):
 
 ```bash
