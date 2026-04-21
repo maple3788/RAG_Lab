@@ -1,0 +1,164 @@
+{
+  "summary": [
+    {
+      "method": "baseline",
+      "n": 5,
+      "em": 0.0,
+      "f1": 0.07521367521367521,
+      "gold_hit": 0.6,
+      "latency_ms": 10268.89866659767
+    },
+    {
+      "method": "self_rag",
+      "n": 5,
+      "em": 0.0,
+      "f1": 0.05627794977640179,
+      "gold_hit": 0.6,
+      "latency_ms": 57961.613875001785,
+      "avg_loops": 1.0,
+      "avg_rewrites": 0.0
+    }
+  ],
+  "baseline": {
+    "method": "baseline",
+    "n": 5,
+    "em": 0.0,
+    "f1": 0.07521367521367521,
+    "gold_hit": 0.6,
+    "latency_ms": 10268.89866659767,
+    "rows": [
+      {
+        "id": "w1",
+        "question": "What is a transformer model?",
+        "answer_pred": "A transformer model is a neural network architecture using self-attention mechanisms to model token relationships, enabling parallel computation and dominating large language models.",
+        "answer_gold": "self-attention",
+        "em": 0.0,
+        "f1": 0.15384615384615385,
+        "gold_hit": 1.0,
+        "latency_ms": 14510.150166999665
+      },
+      {
+        "id": "w2",
+        "question": "What is gradient descent used for?",
+        "answer_pred": "Gradient descent is used to minimize loss functions in machine learning models by updating parameters using gradients.",
+        "answer_gold": "minimize",
+        "em": 0.0,
+        "f1": 0.1111111111111111,
+        "gold_hit": 1.0,
+        "latency_ms": 9361.317375005456
+      },
+      {
+        "id": "w3",
+        "question": "What does a database index improve?",
+        "answer_pred": "A database index improves the speed of data retrieval operations.",
+        "answer_gold": "query",
+        "em": 0.0,
+        "f1": 0.0,
+        "gold_hit": 0.0,
+        "latency_ms": 7364.682290994097
+      },
+      {
+        "id": "w4",
+        "question": "What is overfitting in machine learning?",
+        "answer_pred": "Overfitting occurs when a model learns noise and spurious patterns in training data, leading to poor generalization.",
+        "answer_gold": "generalization",
+        "em": 0.0,
+        "f1": 0.1111111111111111,
+        "gold_hit": 1.0,
+        "latency_ms": 8393.894833992817
+      },
+      {
+        "id": "w5",
+        "question": "What is a vector database used for?",
+        "answer_pred": "",
+        "answer_gold": "similarity",
+        "em": 0.0,
+        "f1": 0.0,
+        "gold_hit": 0.0,
+        "latency_ms": 11714.448665996315
+      }
+    ]
+  },
+  "self_rag": {
+    "method": "self_rag",
+    "n": 5,
+    "em": 0.0,
+    "f1": 0.05627794977640179,
+    "gold_hit": 0.6,
+    "latency_ms": 57961.613875001785,
+    "avg_loops": 1.0,
+    "avg_rewrites": 0.0,
+    "rows": [
+      {
+        "id": "w1",
+        "question": "What is a transformer model?",
+        "question_final": "What is a transformer model?",
+        "answer_pred": "A transformer model is a neural network architecture that uses self-attention mechanisms to model relationships between tokens in a sequence, enabling parallel computation and becoming dominant for large language models [1].",
+        "answer_gold": "self-attention",
+        "passages_used": 1,
+        "loops": 1,
+        "rewrites": 0,
+        "em": 0.0,
+        "f1": 0.11764705882352941,
+        "gold_hit": 1.0,
+        "latency_ms": 74122.48354199983
+      },
+      {
+        "id": "w2",
+        "question": "What is gradient descent used for?",
+        "question_final": "What is gradient descent used for?",
+        "answer_pred": "",
+        "answer_gold": "minimize",
+        "passages_used": 2,
+        "loops": 1,
+        "rewrites": 0,
+        "em": 0.0,
+        "f1": 0.0,
+        "gold_hit": 0.0,
+        "latency_ms": 55049.47012499906
+      },
+      {
+        "id": "w3",
+        "question": "What does a database index improve?",
+        "question_final": "What does a database index improve?",
+        "answer_pred": "A database index improves the speed of data retrieval operations.",
+        "answer_gold": "query",
+        "passages_used": 2,
+        "loops": 1,
+        "rewrites": 0,
+        "em": 0.0,
+        "f1": 0.0,
+        "gold_hit": 0.0,
+        "latency_ms": 47202.989750003326
+      },
+      {
+        "id": "w4",
+        "question": "What is overfitting in machine learning?",
+        "question_final": "What is overfitting in machine learning?",
+        "answer_pred": "Overfitting is when a model learns noise and spurious patterns in training data, leading to poor generalization.",
+        "answer_gold": "generalization",
+        "passages_used": 1,
+        "loops": 1,
+        "rewrites": 0,
+        "em": 0.0,
+        "f1": 0.1111111111111111,
+        "gold_hit": 1.0,
+        "latency_ms": 52844.651333012735
+      },
+      {
+        "id": "w5",
+        "question": "What is a vector database used for?",
+        "question_final": "What is a vector database used for?",
+        "answer_pred": "A vector database is used for storing embeddings and enabling efficient similarity search, such as nearest-neighbor queries over high-dimensional vectors [1], and it is applied in recommendation systems, semantic search, and retrieval-augmented generation [2].",
+        "answer_gold": "similarity",
+        "passages_used": 2,
+        "loops": 1,
+        "rewrites": 0,
+        "em": 0.0,
+        "f1": 0.052631578947368425,
+        "gold_hit": 1.0,
+        "latency_ms": 60588.47462499398
+      }
+    ]
+  }
+}

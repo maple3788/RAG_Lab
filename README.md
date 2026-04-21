@@ -20,6 +20,10 @@ It includes:
 - Key benchmark snapshots and interpretation: [`docs/results.md`](docs/results.md)
 - Traces, error analysis, and ops notes: [`docs/operations.md`](docs/operations.md)
 - Retrieval expansion references: [`docs/knowledge/advanced-rag-techniques-summary.md`](docs/knowledge/advanced-rag-techniques-summary.md)
+- Knowledge notes:
+  - [`docs/knowledge/self-rag-summary.md`](docs/knowledge/self-rag-summary.md)
+  - [`docs/knowledge/knowledge-graph-rag-summary.md`](docs/knowledge/knowledge-graph-rag-summary.md)
+  - [`docs/knowledge/vector-databases-2026-summary.md`](docs/knowledge/vector-databases-2026-summary.md)
 
 ## Minimal Quick Start
 
@@ -50,6 +54,14 @@ Optional local services (MinIO + Redis + monitoring):
 ```bash
 docker compose up -d
 ```
+
+Run Self-RAG experiment with local Ollama (`qwen3:8b`):
+
+```bash
+python experiments/exp_self_rag_ollama.py --llm-model qwen3:8b --max-examples 30
+```
+
+Outputs are written under `results/` (summary CSV, per-example CSV, and JSON report).
 
 ## Repository Map
 
