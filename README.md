@@ -24,6 +24,11 @@ It includes:
   - [`docs/knowledge/self-rag-summary.md`](docs/knowledge/self-rag-summary.md)
   - [`docs/knowledge/knowledge-graph-rag-summary.md`](docs/knowledge/knowledge-graph-rag-summary.md)
   - [`docs/knowledge/vector-databases-2026-summary.md`](docs/knowledge/vector-databases-2026-summary.md)
+  - [`docs/knowledge/late-chunking-summary.md`](docs/knowledge/late-chunking-summary.md)
+  - [`docs/knowledge/corrective-rag-crag-summary.md`](docs/knowledge/corrective-rag-crag-summary.md)
+  - [`docs/knowledge/rag-vs-cag-summary.md`](docs/knowledge/rag-vs-cag-summary.md)
+  - [`docs/knowledge/raft-summary.md`](docs/knowledge/raft-summary.md)
+  - [`docs/knowledge/nlu-summary.md`](docs/knowledge/nlu-summary.md)
 
 ## Minimal Quick Start
 
@@ -62,6 +67,14 @@ python experiments/exp_self_rag_ollama.py --llm-model qwen3:8b --max-examples 30
 ```
 
 Outputs are written under `results/` (summary CSV, per-example CSV, and JSON report).
+
+Run Late Chunking retrieval comparison:
+
+```bash
+python experiments/exp_late_chunking.py --top-k 3
+```
+
+This writes `results/late_chunking_results.csv` with naive vs late chunking recall.
 
 ## Repository Map
 

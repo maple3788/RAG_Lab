@@ -7,8 +7,18 @@ This document lists the main evaluation scripts and expected outputs.
 - `experiments/exp_embedding.py`
 - `experiments/exp_chunk_size.py`
 - `experiments/exp_rerank.py`
+- `experiments/exp_late_chunking.py` (naive vs late chunking retrieval comparison)
 
 Metric family: `recall@k` on QA JSONL data.
+
+Late chunking usage:
+
+```bash
+python experiments/exp_late_chunking.py --data-path datasets/qa_dataset.jsonl --top-k 3
+```
+
+Output:
+- `results/late_chunking_results.csv`
 
 ## IR benchmark (BEIR / TREC-COVID)
 

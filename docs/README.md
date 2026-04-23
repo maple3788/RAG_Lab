@@ -19,6 +19,12 @@ Use this page as the entry point for project documentation.
 
 - [`gemini-region-restriction.md`](gemini-region-restriction.md): Gemini regional/API restrictions and workaround notes
 - [`knowledge/advanced-rag-techniques-summary.md`](knowledge/advanced-rag-techniques-summary.md): concise retrieval/generation technique notes (query expansion, reranking, hybrid retrieval)
+- [`knowledge/self-rag-summary.md`](knowledge/self-rag-summary.md): self-RAG feedback-loop concepts and practical rollout notes
+- [`knowledge/late-chunking-summary.md`](knowledge/late-chunking-summary.md): late chunking concept and context-preserving retrieval notes
+- [`knowledge/corrective-rag-crag-summary.md`](knowledge/corrective-rag-crag-summary.md): CRAG flow (retrieve, evaluate, correct, generate)
+- [`knowledge/rag-vs-cag-summary.md`](knowledge/rag-vs-cag-summary.md): decision framework for RAG vs CAG vs hybrid routing
+- [`knowledge/raft-summary.md`](knowledge/raft-summary.md): retrieval-aware fine-tuning (RAFT) summary and implications
+- [`knowledge/nlu-summary.md`](knowledge/nlu-summary.md): NLU fundamentals and relevance to query understanding
 - [`SESSION_SUMMARY.md`](SESSION_SUMMARY.md): historical session summary notes
 - [`gpuhub-git-push.md`](gpuhub-git-push.md): environment-specific git push notes
 
