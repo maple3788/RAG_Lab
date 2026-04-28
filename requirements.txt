@@ -26,6 +26,7 @@ rapidocr-onnxruntime>=1.2.0
 minio>=7.2.0
 redis>=5.0.0
 pymilvus>=2.4.0
+neo4j>=5.0.0
 prometheus_client>=0.20.0
 fastapi>=0.115.0
 uvicorn>=0.30.0
